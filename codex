@@ -2431,9 +2431,8 @@ class AdvancedOrderFlow:
         # Calculate magnet volume velocity (if we have historical data)
         magnet_velocity = 0.0
         if len(self.depth_snapshots) >= 2:
-            prev_snapshot = self.depth_snapshots[-2]
-            prev_bids = prev_snapshot.get("bids", [])
-            prev_asks = prev_snapshot.get("asks", [])
+            # depth_snapshots stores tuples: (timestamp, bids, asks)
+            _, prev_bids, prev_asks = self.depth_snapshots[-2]
             
             if prev_bids and prev_asks and magnet_levels:
                 # Check volume change at strongest magnet
