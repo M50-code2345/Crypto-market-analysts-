@@ -1765,6 +1765,9 @@ class AdvancedOrderFlow:
         # ===== NEW: Smart Order Detection =====
         snapshot["smart_order_detection"] = self._compute_smart_order_detection(cutoff_time)
         
+        # ===== TIER 1: Trade Flow Metrics =====
+        snapshot["tier1"] = self._compute_tier1_trade_metrics(cutoff_time)
+        
         # ===== TIER 2: Core Depth Metrics =====
         snapshot["tier2"] = self._compute_tier2_depth_metrics(cutoff_time)
         
@@ -1776,6 +1779,64 @@ class AdvancedOrderFlow:
         self._reset_30s_accumulators()
         
         return snapshot
+    
+    def _compute_tier1_trade_metrics(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Compute TIER 1 trade flow metrics including aggressive buy/sell volumes and counts.
+        These metrics capture market order flow from the aggTrade stream.
+        """
+        features = {}
+        
+        # Calculate recent aggressive trade volumes and counts (last 30 seconds)
+        recent_buy_vol = sum(vol for ts, vol in self.aggressive_buy_vol if ts >= cutoff_time)
+        recent_sell_vol = sum(vol for ts, vol in self.aggressive_sell_vol if ts >= cutoff_time)
+        
+        # Count recent trades
+        recent_buy_count = sum(1 for ts, vol in self.aggressive_buy_vol if ts >= cutoff_time)
+        recent_sell_count = sum(1 for ts, vol in self.aggressive_sell_vol if ts >= cutoff_time)
+        
+        # Export to features
+        features["aggressive_buy_vol"] = recent_buy_vol
+        features["aggressive_sell_vol"] = recent_sell_vol
+        features["aggressive_buy_count"] = recent_buy_count
+        features["aggressive_sell_count"] = recent_sell_count
+        
+        # Trade size percentiles from recent trades
+        if len(self.trade_sizes) > 0:
+            recent_sizes = [size for size in self.trade_sizes if len(self.trade_sizes) > 0]
+            if len(recent_sizes) > 0:
+                sorted_sizes = sorted(recent_sizes)
+                features["trade_size_p50"] = sorted_sizes[len(sorted_sizes) // 2] if len(sorted_sizes) > 0 else 0
+                features["trade_size_p75"] = sorted_sizes[int(len(sorted_sizes) * 0.75)] if len(sorted_sizes) > 0 else 0
+                features["trade_size_p90"] = sorted_sizes[int(len(sorted_sizes) * 0.90)] if len(sorted_sizes) > 0 else 0
+                features["trade_size_p95"] = sorted_sizes[int(len(sorted_sizes) * 0.95)] if len(sorted_sizes) > 0 else 0
+                features["trade_size_p99"] = sorted_sizes[int(len(sorted_sizes) * 0.99)] if len(sorted_sizes) > 0 else 0
+            else:
+                features["trade_size_p50"] = 0
+                features["trade_size_p75"] = 0
+                features["trade_size_p90"] = 0
+                features["trade_size_p95"] = 0
+                features["trade_size_p99"] = 0
+        else:
+            features["trade_size_p50"] = 0
+            features["trade_size_p75"] = 0
+            features["trade_size_p90"] = 0
+            features["trade_size_p95"] = 0
+            features["trade_size_p99"] = 0
+        
+        # Last price from VWAP or depth if available
+        if self.vwap_30s:
+            features["last_price"] = self.vwap_30s
+        elif self.depth_snapshots:
+            _, bids, asks = self.depth_snapshots[-1]
+            if bids and asks:
+                features["last_price"] = (bids[0][0] + asks[0][0]) / 2
+            else:
+                features["last_price"] = 0
+        else:
+            features["last_price"] = 0
+        
+        return features
     
     def _compute_tier2_depth_metrics(self, cutoff_time: float) -> Dict[str, Any]:
         """
