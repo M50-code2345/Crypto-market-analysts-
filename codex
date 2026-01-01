@@ -2189,15 +2189,17 @@ class AdvancedOrderFlow:
         # ========== 1. VOLUME-WEIGHTED SPREAD ANALYSIS ==========
         
         # Calculate volume-weighted mid price
-        bid_vwap = sum(p * q for p, q in latest_bids[:10]) / (sum(q for _, q in latest_bids[:10]) + 1e-8)
-        ask_vwap = sum(p * q for p, q in latest_asks[:10]) / (sum(q for _, q in latest_asks[:10]) + 1e-8)
+        # PRIORITY 2 ENHANCEMENT: Expand VW spread to 50+ levels for deeper liquidity analysis
+        depth_levels = min(50, len(latest_bids), len(latest_asks))
+        bid_vwap = sum(p * q for p, q in latest_bids[:depth_levels]) / (sum(q for _, q in latest_bids[:depth_levels]) + 1e-8)
+        ask_vwap = sum(p * q for p, q in latest_asks[:depth_levels]) / (sum(q for _, q in latest_asks[:depth_levels]) + 1e-8)
         vw_mid = (bid_vwap + ask_vwap) / 2
         
         # Quoted spread
         quoted_spread = latest_asks[0][0] - latest_bids[0][0]
         quoted_spread_bps = (quoted_spread / vw_mid) * 10000
         
-        # Volume-weighted spread
+        # Volume-weighted spread (now using 50+ levels)
         vw_spread = ask_vwap - bid_vwap
         vw_spread_bps = (vw_spread / vw_mid) * 10000
         
@@ -2304,27 +2306,43 @@ class AdvancedOrderFlow:
         liquidity_cliffs_bid = []
         liquidity_cliffs_ask = []
         
-        # Detect sudden liquidity drops (>50% decrease between consecutive levels)
-        for i in range(1, min(20, len(latest_bids))):
+        # PRIORITY 2 ENHANCEMENT: Detect sudden liquidity drops with slippage calculation
+        # Expanded from 20 to 50 levels for deeper cliff detection
+        cliff_depth = min(50, len(latest_bids), len(latest_asks))
+        
+        total_slippage_bid = 0.0
+        total_slippage_ask = 0.0
+        
+        for i in range(1, cliff_depth):
             vol_drop_pct = (latest_bids[i-1][1] - latest_bids[i][1]) / (latest_bids[i-1][1] + 1e-8) * 100
             if vol_drop_pct > 50:
+                # Calculate slippage: price distance from best bid to cliff
+                slippage_bps = abs(latest_bids[0][0] - latest_bids[i][0]) / latest_bids[0][0] * 10000
+                total_slippage_bid += slippage_bps
                 liquidity_cliffs_bid.append({
                     "price": latest_bids[i][0],
                     "drop_pct": vol_drop_pct,
-                    "level": i
+                    "level": i,
+                    "slippage_bps": slippage_bps
                 })
         
-        for i in range(1, min(20, len(latest_asks))):
+        for i in range(1, cliff_depth):
             vol_drop_pct = (latest_asks[i-1][1] - latest_asks[i][1]) / (latest_asks[i-1][1] + 1e-8) * 100
             if vol_drop_pct > 50:
+                # Calculate slippage: price distance from best ask to cliff
+                slippage_bps = abs(latest_asks[i][0] - latest_asks[0][0]) / latest_asks[0][0] * 10000
+                total_slippage_ask += slippage_bps
                 liquidity_cliffs_ask.append({
                     "price": latest_asks[i][0],
                     "drop_pct": vol_drop_pct,
-                    "level": i
+                    "level": i,
+                    "slippage_bps": slippage_bps
                 })
         
         features["liquidity_cliffs_bid_count"] = len(liquidity_cliffs_bid)
         features["liquidity_cliffs_ask_count"] = len(liquidity_cliffs_ask)
+        features["liquidity_cliff_slippage_bid_bps"] = total_slippage_bid
+        features["liquidity_cliff_slippage_ask_bps"] = total_slippage_ask
         
         # Stop-loss cluster detection (round numbers with high volume concentration)
         mid_price = (latest_bids[0][0] + latest_asks[0][0]) / 2
@@ -2369,14 +2387,69 @@ class AdvancedOrderFlow:
         
         # Layering pattern detection
         layering_patterns = 0
-        # Check for sequential orders at similar sizes (layering pattern)
-        for i in range(min(5, len(latest_bids) - 2)):
+        # PRIORITY 2 ENHANCEMENT: Check for sequential orders at similar sizes (layering pattern)
+        # Expanded from 5 to 30 levels for comprehensive institutional layering detection
+        layering_depth = min(30, len(latest_bids) - 2)
+        for i in range(layering_depth):
             if (abs(latest_bids[i][1] - latest_bids[i+1][1]) / (latest_bids[i][1] + 1e-8) < 0.1 and
                 abs(latest_bids[i+1][1] - latest_bids[i+2][1]) / (latest_bids[i+1][1] + 1e-8) < 0.1):
                 layering_patterns += 1
         
+        # Check ask side layering as well
+        for i in range(min(30, len(latest_asks) - 2)):
+            if (abs(latest_asks[i][1] - latest_asks[i+1][1]) / (latest_asks[i][1] + 1e-8) < 0.1 and
+                abs(latest_asks[i+1][1] - latest_asks[i+2][1]) / (latest_asks[i+1][1] + 1e-8) < 0.1):
+                layering_patterns += 1
+        
         features["layering_patterns_count"] = layering_patterns
         features["manipulation_probability"] = "high" if (spoofing_events > 2 and layering_patterns > 2) else "low"
+        
+        # PRIORITY 2 ENHANCEMENT: Magnet volume velocity tracking
+        # Track volume accumulation rate at psychologically significant levels (round numbers)
+        magnet_levels = []
+        mid_price = (latest_bids[0][0] + latest_asks[0][0]) / 2
+        
+        # Check for round number magnets (e.g., $88,000, $87,500, etc.)
+        for price_level in [mid_price - (mid_price % 100) + offset for offset in [-500, -250, 0, 250, 500]]:
+            # Find volume near this magnet level (within 10 bps)
+            magnet_range_bps = 10
+            magnet_range = price_level * (magnet_range_bps / 10000)
+            
+            bid_vol_near_magnet = sum(q for p, q in latest_bids if abs(p - price_level) < magnet_range)
+            ask_vol_near_magnet = sum(q for p, q in latest_asks if abs(p - price_level) < magnet_range)
+            
+            if bid_vol_near_magnet > 0 or ask_vol_near_magnet > 0:
+                magnet_levels.append({
+                    "price": price_level,
+                    "bid_volume": bid_vol_near_magnet,
+                    "ask_volume": ask_vol_near_magnet,
+                    "total_volume": bid_vol_near_magnet + ask_vol_near_magnet
+                })
+        
+        # Calculate magnet volume velocity (if we have historical data)
+        magnet_velocity = 0.0
+        if len(self.depth_snapshots) >= 2:
+            prev_snapshot = self.depth_snapshots[-2]
+            prev_bids = prev_snapshot.get("bids", [])
+            prev_asks = prev_snapshot.get("asks", [])
+            
+            if prev_bids and prev_asks and magnet_levels:
+                # Check volume change at strongest magnet
+                strongest_magnet = max(magnet_levels, key=lambda x: x["total_volume"])
+                magnet_price = strongest_magnet["price"]
+                magnet_range = magnet_price * (10 / 10000)
+                
+                prev_vol_near_magnet = sum(q for p, q in prev_bids if abs(p - magnet_price) < magnet_range)
+                prev_vol_near_magnet += sum(q for p, q in prev_asks if abs(p - magnet_price) < magnet_range)
+                
+                current_vol = strongest_magnet["total_volume"]
+                time_diff = (latest_snapshot.get("timestamp", 0) - prev_snapshot.get("timestamp", 0))
+                
+                if time_diff > 0:
+                    magnet_velocity = (current_vol - prev_vol_near_magnet) / time_diff
+        
+        features["magnet_volume_velocity"] = magnet_velocity
+        features["magnet_levels_count"] = len(magnet_levels)
         
         # ========== 5. SUPPORT/RESISTANCE STRENGTH SCORING ==========
         
@@ -2603,6 +2676,8 @@ class AdvancedOrderFlow:
             # Liquidity Cliffs
             "liquidity_cliffs_bid_count": 0,
             "liquidity_cliffs_ask_count": 0,
+            "liquidity_cliff_slippage_bid_bps": 0.0,
+            "liquidity_cliff_slippage_ask_bps": 0.0,
             "stop_loss_cluster_count": 0,
             "liquidity_vacuum_bid_levels": 0,
             "liquidity_vacuum_ask_levels": 0,
@@ -2615,6 +2690,8 @@ class AdvancedOrderFlow:
             "spoofing_risk": "low",
             "layering_patterns_count": 0,
             "manipulation_probability": "low",
+            "magnet_volume_velocity": 0.0,
+            "magnet_levels_count": 0,
             
             # Support/Resistance
             "dynamic_support_price": 0.0,
