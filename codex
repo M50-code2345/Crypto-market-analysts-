@@ -3536,7 +3536,7 @@ class AdvancedOrderFlow:
             
             # Trap if current is 3x larger than neighbors
             if current_vol > prev_vol * 3 and current_vol > next_vol * 3:
-                trap_score = min(100, (current_vol / max(prev_vol, next_vol)) * 10)
+                trap_score = min(100, (current_vol / max(prev_vol, next_vol, 1e-8)) * 10)
                 self.liquidity_traps_bid.append((latest_bids[i][0], current_vol, trap_score))
         
         self.trap_count_bid = len(self.liquidity_traps_bid)
@@ -3548,7 +3548,7 @@ class AdvancedOrderFlow:
             next_vol = latest_asks[i + 1][1]
             
             if current_vol > prev_vol * 3 and current_vol > next_vol * 3:
-                trap_score = min(100, (current_vol / max(prev_vol, next_vol)) * 10)
+                trap_score = min(100, (current_vol / max(prev_vol, next_vol, 1e-8)) * 10)
                 self.liquidity_traps_ask.append((latest_asks[i][0], current_vol, trap_score))
         
         self.trap_count_ask = len(self.liquidity_traps_ask)
