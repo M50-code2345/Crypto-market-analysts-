@@ -1762,6 +1762,9 @@ class AdvancedOrderFlow:
         # ===== NEW: Liquidity Vacuum Detection =====
         snapshot["liquidity_vacuum"] = self._compute_liquidity_vacuum(cutoff_time)
         
+        # ===== TIER 2: Core Depth Metrics =====
+        snapshot["tier2"] = self._compute_tier2_depth_metrics(cutoff_time)
+        
         # Store snapshot
         self.snapshot_history.append(snapshot)
         self.last_snapshot_time = current_time
@@ -1770,6 +1773,61 @@ class AdvancedOrderFlow:
         self._reset_30s_accumulators()
         
         return snapshot
+    
+    def _compute_tier2_depth_metrics(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Compute TIER 2 depth metrics including depth imbalances at various levels.
+        These are core order book metrics that show buyer/seller pressure.
+        """
+        features = {}
+        
+        # Get the latest depth snapshot
+        if not self.depth_snapshots:
+            return {
+                "depth_imbalance_l1": 0.0,
+                "depth_imbalance_l5": 0.0,
+                "depth_l10_bid": 0.0,
+                "depth_l10_ask": 0.0,
+                "depth_l20_bid": 0.0,
+                "depth_l20_ask": 0.0,
+                "vwap_30s": 0.0,
+                "avg_spread_30s": 0.0
+            }
+        
+        _, bids, asks = self.depth_snapshots[-1]
+        
+        # L1 Depth Imbalance (best bid/ask)
+        if bids and asks:
+            bid_l1 = bids[0][1] if len(bids) > 0 else 0.0
+            ask_l1 = asks[0][1] if len(asks) > 0 else 0.0
+            features["depth_imbalance_l1"] = (bid_l1 - ask_l1) / (bid_l1 + ask_l1 + 1e-8)
+        else:
+            features["depth_imbalance_l1"] = 0.0
+        
+        # L5 Depth Imbalance (top 5 levels)
+        if len(bids) >= 5 and len(asks) >= 5:
+            bid_l5 = sum(q for _, q in bids[:5])
+            ask_l5 = sum(q for _, q in asks[:5])
+            features["depth_imbalance_l5"] = (bid_l5 - ask_l5) / (bid_l5 + ask_l5 + 1e-8)
+        else:
+            features["depth_imbalance_l5"] = 0.0
+        
+        # L10 Depth (for display calculations)
+        features["depth_l10_bid"] = self.depth_l10.get("bid", 0.0)
+        features["depth_l10_ask"] = self.depth_l10.get("ask", 0.0)
+        
+        # L20 Depth (for display calculations)
+        features["depth_l20_bid"] = self.depth_l20.get("bid", 0.0)
+        features["depth_l20_ask"] = self.depth_l20.get("ask", 0.0)
+        
+        # VWAP (30-second)
+        features["vwap_30s"] = self.vwap_30s if self.vwap_30s else 0.0
+        
+        # Average spread (30-second)
+        recent_spreads = [spread for ts, spread in self.spread_history if ts >= cutoff_time]
+        features["avg_spread_30s"] = safe_mean(recent_spreads, 0.0)
+        
+        return features
     
     def _compute_new_orderbook_features(self, cutoff_time: float) -> Dict[str, Any]:
         """
