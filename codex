@@ -7310,36 +7310,35 @@ class MarketClient:
             
         _, bids, asks = self.advanced_orderflow.depth_snapshots[-1]
         
-        # CRITICAL: Filter out invalid/stale price levels BEFORE displaying
-        # Remove outlier orders that are way beyond reasonable price range
+        # CRITICAL: Use actual best bid/ask for mid-price calculation
+        # Calculate mid-price from RAW orderbook BEFORE any filtering
         if bids and asks:
-            # Use most recent valid price for reference
-            ref_price = asks[0][0] if asks[0][0] < 999999 else (bids[0][0] if bids[0][0] > 1 else 87000)
+            # Get best bid and best ask directly from orderbook
+            best_bid = bids[0][0]
+            best_ask = asks[0][0]
+            mid_price = (best_bid + best_ask) / 2
+            spread_pct = ((best_ask - best_bid) / mid_price) * 100
             
-            # Filter out extreme outliers (>30% away) - these are clearly stale/invalid
-            max_outlier_distance = ref_price * 0.30
+            # Sanity check: spread should be < 1% for BTC/USDT
+            if spread_pct > 1.0:
+                print(f"     ⚠️  WARNING: Abnormal spread detected ({spread_pct:.3f}%) - possible data issue")
+            
+            # Apply ±10% filter AFTER calculating mid-price from clean top-of-book
+            # This preserves actual market price while filtering display range
+            max_price_distance = mid_price * 0.10
             original_bid_count = len(bids)
             original_ask_count = len(asks)
-            bids = [(p, q) for p, q in bids if ref_price - p <= max_outlier_distance and p > 1]
-            asks = [(p, q) for p, q in asks if p - ref_price <= max_outlier_distance and p < 999999]
+            bids = [(p, q) for p, q in bids if mid_price - p <= max_price_distance and p > 1]
+            asks = [(p, q) for p, q in asks if p - mid_price <= max_price_distance and p < 999999]
             
-            outliers_removed = (original_bid_count - len(bids)) + (original_ask_count - len(asks))
+            filtered_count = (original_bid_count - len(bids)) + (original_ask_count - len(asks))
             
             if not bids or not asks:
-                print("     ⚠️  Insufficient valid depth data after removing outliers")
+                print("     ⚠️  Insufficient depth data after filtering")
                 return
             
-            # After removing outliers, calculate mid-price from cleaned data
-            mid_price = (bids[0][0] + asks[0][0]) / 2
-            spread_pct = ((asks[0][0] - bids[0][0]) / mid_price) * 100
-            
-            # Further filter to within 10% for display (keeps more valid data than 5%)
-            max_price_distance = mid_price * 0.10
-            bids = [(p, q) for p, q in bids if mid_price - p <= max_price_distance]
-            asks = [(p, q) for p, q in asks if p - mid_price <= max_price_distance]
-            
-            if outliers_removed > 0:
-                print(f"     ✅ Filtered out {outliers_removed} outlier orders (>30% from market)")
+            if filtered_count > 0:
+                print(f"     ✅ Filtered {filtered_count} orders outside ±10% range for display")
             print(f"     ✅ Displaying price levels within ±10% of mid: ${mid_price:,.2f} (Spread: {spread_pct:.3f}%)")
         
         # Analyze top 20 levels on each side
