@@ -1860,6 +1860,62 @@ class AdvancedOrderFlow:
             features["trade_size_p95"] = 0
             features["trade_size_p99"] = 0
         
+        # Large Order Tracking (>$10K trades)
+        recent_large_orders = [order for order in self.large_orders if order[0] >= cutoff_time]
+        features["large_order_count"] = len(recent_large_orders)
+        large_buy_count = sum(1 for order in recent_large_orders if order[1] == 'buy')
+        large_sell_count = sum(1 for order in recent_large_orders if order[1] == 'sell')
+        features["large_order_buy_count"] = large_buy_count
+        features["large_order_sell_count"] = large_sell_count
+        features["large_order_total_notional"] = sum(order[3] for order in recent_large_orders)
+        
+        # Whale Trade Tracking (>$25K trades)
+        recent_whale_trades = [trade for trade in self.whale_trades if trade[0] >= cutoff_time]
+        features["whale_trade_count"] = len(recent_whale_trades)
+        whale_buy_count = sum(1 for trade in recent_whale_trades if trade[1] == 'buy')
+        whale_sell_count = sum(1 for trade in recent_whale_trades if trade[1] == 'sell')
+        features["whale_buy_count"] = whale_buy_count
+        features["whale_sell_count"] = whale_sell_count
+        features["whale_total_notional"] = sum(trade[3] for trade in recent_whale_trades)
+        
+        # Block Trade Tracking (institutional size >$100K from block_trades_enhanced)
+        recent_block_trades = [trade for trade in self.block_trades_enhanced if trade[0] >= cutoff_time]
+        features["block_trade_count"] = len(recent_block_trades)
+        block_buy_count = sum(1 for trade in recent_block_trades if trade[1] == 'buy')
+        block_sell_count = sum(1 for trade in recent_block_trades if trade[1] == 'sell')
+        features["block_buy_count"] = block_buy_count
+        features["block_sell_count"] = block_sell_count
+        features["block_total_notional"] = sum(trade[3] for trade in recent_block_trades)
+        
+        # Smart Money Metrics
+        total_trades = recent_buy_count + recent_sell_count
+        smart_money_trades = features["large_order_count"] + features["block_trade_count"]
+        features["smart_money_ratio"] = (smart_money_trades / total_trades) if total_trades > 0 else 0
+        
+        # Institutional Bias (buy vs sell pressure from large/whale/block trades)
+        institutional_buy_notional = (
+            sum(order[3] for order in recent_large_orders if order[1] == 'buy') +
+            sum(trade[3] for trade in recent_whale_trades if trade[1] == 'buy') +
+            sum(trade[3] for trade in recent_block_trades if trade[1] == 'buy')
+        )
+        institutional_sell_notional = (
+            sum(order[3] for order in recent_large_orders if order[1] == 'sell') +
+            sum(trade[3] for trade in recent_whale_trades if trade[1] == 'sell') +
+            sum(trade[3] for trade in recent_block_trades if trade[1] == 'sell')
+        )
+        total_institutional_notional = institutional_buy_notional + institutional_sell_notional
+        
+        if total_institutional_notional > 0:
+            # Bias: +1 = all institutional buying, -1 = all institutional selling, 0 = balanced
+            features["institutional_bias"] = (institutional_buy_notional - institutional_sell_notional) / total_institutional_notional
+        else:
+            features["institutional_bias"] = 0
+        
+        # Trade Size Bucket Analytics (micro/small/medium/large/block distribution)
+        features["size_bucket_volumes"] = dict(self.size_bucket_volumes)
+        features["size_bucket_counts"] = dict(self.size_bucket_counts)
+        features["size_bucket_notionals"] = dict(self.size_bucket_notionals)
+        
         return features
     
     def _compute_tier2_depth_metrics(self, cutoff_time: float) -> Dict[str, Any]:
