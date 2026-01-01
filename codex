@@ -1762,6 +1762,9 @@ class AdvancedOrderFlow:
         # ===== NEW: Liquidity Vacuum Detection =====
         snapshot["liquidity_vacuum"] = self._compute_liquidity_vacuum(cutoff_time)
         
+        # ===== NEW: Smart Order Detection =====
+        snapshot["smart_order_detection"] = self._compute_smart_order_detection(cutoff_time)
+        
         # ===== TIER 2: Core Depth Metrics =====
         snapshot["tier2"] = self._compute_tier2_depth_metrics(cutoff_time)
         
@@ -3451,6 +3454,262 @@ class AdvancedOrderFlow:
             "correlation_breakdown_signal": False,
             "deep_book_support_score": 0.0,
             "deep_book_resistance_score": 0.0,
+        }
+    
+    def _compute_smart_order_detection(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Detect sophisticated order types and manipulative patterns.
+        
+        Implements:
+        1. Iceberg detection (repeated fills + volume regeneration)
+        2. Peg order tracking (orders following mid-price)
+        3. Fake liquidity scoring (cancelled-before-fill ratio)
+        4. Front-running detection (order timing analysis)
+        5. Wall flip tracking (support/resistance role changes)
+        6. L1 queue change recording (best price level volume tracking)
+        """
+        features = {}
+        
+        # Get recent depth snapshots (last 30 seconds)
+        recent_snapshots = [s for s in list(self.depth_snapshots) if s[0] >= cutoff_time]
+        
+        if len(recent_snapshots) < 3:
+            return self._get_empty_smart_order_features()
+        
+        # 1. ICEBERG ORDER DETECTION
+        # Look for price levels with repeated volume regeneration after consumption
+        iceberg_candidates = {}
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Check both sides for iceberg patterns
+            for side, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
+                prev_dict = {p: q for p, q in prev_levels[:20]}
+                curr_dict = {p: q for p, q in curr_levels[:20]}
+                
+                # Find prices that exist in both snapshots
+                common_prices = set(prev_dict.keys()) & set(curr_dict.keys())
+                
+                for price in common_prices:
+                    prev_vol = prev_dict[price]
+                    curr_vol = curr_dict[price]
+                    
+                    # Iceberg pattern: volume decreased then increased again (regenerated)
+                    # This suggests hidden orders replenishing visible size
+                    if curr_vol > prev_vol * 0.8 and prev_vol > 0:
+                        # Volume regenerated - potential iceberg
+                        key = (side, price)
+                        if key not in iceberg_candidates:
+                            iceberg_candidates[key] = {"regenerations": 0, "total_regen_vol": 0.0, "price": price}
+                        iceberg_candidates[key]["regenerations"] += 1
+                        iceberg_candidates[key]["total_regen_vol"] += (curr_vol - prev_vol * 0.8)
+        
+        # Filter for strong iceberg signals (2+ regenerations)
+        confirmed_icebergs = {k: v for k, v in iceberg_candidates.items() if v["regenerations"] >= 2}
+        
+        features["iceberg_order_count"] = len(confirmed_icebergs)
+        features["iceberg_estimated_hidden_volume"] = sum(v["total_regen_vol"] for v in confirmed_icebergs.values())
+        
+        # Update class state
+        self.iceberg_size_estimate = {v["price"]: v["total_regen_vol"] for v in confirmed_icebergs.values()}
+        
+        # 2. PEG ORDER DETECTION
+        # Orders that move with mid-price (maintain relative distance)
+        peg_count = 0
+        
+        if len(recent_snapshots) >= 5:
+            # Track orders across snapshots
+            for i in range(len(recent_snapshots) - 4):
+                snapshots_window = recent_snapshots[i:i+5]
+                
+                # Calculate mid-price for each snapshot
+                mid_prices = []
+                bid_levels_by_snapshot = []
+                ask_levels_by_snapshot = []
+                
+                for ts, bids, asks in snapshots_window:
+                    if bids and asks:
+                        mid = (bids[0][0] + asks[0][0]) / 2
+                        mid_prices.append(mid)
+                        bid_levels_by_snapshot.append({p: q for p, q in bids[:10]})
+                        ask_levels_by_snapshot.append({p: q for p, q in asks[:10]})
+                
+                if len(mid_prices) == 5:
+                    # Look for orders maintaining relative position as mid moves
+                    mid_change = mid_prices[-1] - mid_prices[0]
+                    
+                    if abs(mid_change) > mid_prices[0] * 0.0001:  # Mid moved meaningfully
+                        # Check if any price levels moved proportionally
+                        for side, levels_by_snapshot in [("bid", bid_levels_by_snapshot), ("ask", ask_levels_by_snapshot)]:
+                            # Track price movement
+                            for snapshot_idx in range(len(levels_by_snapshot) - 1):
+                                curr_prices = set(levels_by_snapshot[snapshot_idx].keys())
+                                next_prices = set(levels_by_snapshot[snapshot_idx + 1].keys())
+                                
+                                # Look for orders that "moved" with mid-price
+                                for curr_price in curr_prices:
+                                    expected_new_price = curr_price + (mid_prices[snapshot_idx + 1] - mid_prices[snapshot_idx])
+                                    
+                                    # Check if there's a similar order at expected price
+                                    for next_price in next_prices:
+                                        if abs(next_price - expected_new_price) < mid_prices[0] * 0.0001:
+                                            peg_count += 1
+                                            break
+        
+        features["peg_order_count"] = peg_count
+        self.peg_order_count = peg_count
+        
+        # 3. FAKE LIQUIDITY DETECTION
+        # Orders that get cancelled before being filled
+        cancelled_before_fill = 0
+        total_disappeared = 0
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Check both sides
+            for prev_levels, curr_levels in [(prev_bids, curr_bids), (prev_asks, curr_asks)]:
+                prev_dict = {p: q for p, q in prev_levels[:20]}
+                curr_dict = {p: q for p, q in curr_levels[:20]}
+                
+                # Find orders that disappeared
+                disappeared_prices = set(prev_dict.keys()) - set(curr_dict.keys())
+                
+                for price in disappeared_prices:
+                    total_disappeared += 1
+                    
+                    # If volume > 50% of original, likely cancelled (not filled)
+                    # Filled orders typically reduce gradually
+                    if price in prev_dict and prev_dict[price] > 0:
+                        # Check if it was away from best price (not likely to be filled)
+                        best_price = prev_levels[0][0] if prev_levels else price
+                        distance_pct = abs(price - best_price) / best_price
+                        
+                        if distance_pct > 0.0002:  # > 2 bps from best
+                            cancelled_before_fill += 1
+        
+        fake_liquidity_ratio = cancelled_before_fill / (total_disappeared + 1e-8)
+        features["fake_liquidity_score"] = min(fake_liquidity_ratio, 1.0)
+        self.fake_liquidity_score = features["fake_liquidity_score"]
+        
+        # 4. FRONT-RUNNING DETECTION
+        # Orders inserted immediately before large trades
+        front_running_count = 0
+        
+        # Look for patterns: new order appears -> large order fills shortly after
+        for i in range(1, min(len(recent_snapshots), 10)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            time_diff = curr_ts - prev_ts
+            
+            # Look for new orders (very short time between snapshots suggests insertion)
+            if time_diff < 0.2:  # < 200ms (fast insertion)
+                for side, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
+                    prev_dict = {p: q for p, q in prev_levels[:5]}  # Top 5 levels
+                    curr_dict = {p: q for p, q in curr_levels[:5]}
+                    
+                    # New prices that appeared
+                    new_prices = set(curr_dict.keys()) - set(prev_dict.keys())
+                    
+                    # If new order at/near best price with significant size
+                    if new_prices and curr_levels:
+                        best_price = curr_levels[0][0]
+                        for new_price in new_prices:
+                            if abs(new_price - best_price) / best_price < 0.0001:  # Within 1 bp of best
+                                if curr_dict[new_price] > 0.1:  # Significant size
+                                    front_running_count += 1
+                                    self.front_running_events.append((curr_ts, side, new_price, curr_dict[new_price]))
+        
+        features["front_running_events"] = front_running_count
+        
+        # 5. WALL FLIP TRACKING
+        # Track when support becomes resistance or vice versa
+        wall_flips = 0
+        
+        # Look back further for wall flip detection (need 10+ snapshots)
+        all_snapshots = list(self.depth_snapshots)[-20:] if len(self.depth_snapshots) >= 20 else list(self.depth_snapshots)
+        
+        if len(all_snapshots) >= 10:
+            # Build price-to-side mapping over time
+            price_sides = {}  # price -> list of (timestamp, side, volume)
+            
+            for ts, bids, asks in all_snapshots:
+                # Track significant levels (walls)
+                for p, q in bids[:10]:
+                    if q > 1.0:  # Significant volume
+                        if p not in price_sides:
+                            price_sides[p] = []
+                        price_sides[p].append((ts, "bid", q))
+                
+                for p, q in asks[:10]:
+                    if q > 1.0:  # Significant volume
+                        if p not in price_sides:
+                            price_sides[p] = []
+                        price_sides[p].append((ts, "ask", q))
+            
+            # Detect flips: same price showing as both bid and ask over time
+            for price, history in price_sides.items():
+                if len(history) >= 3:
+                    sides_seen = [side for _, side, _ in history]
+                    # Check if side changed
+                    if "bid" in sides_seen and "ask" in sides_seen:
+                        # Wall flipped
+                        wall_flips += 1
+                        self.wall_flip_events.append((history[-1][0], price, history[0][1], history[-1][1]))
+        
+        features["wall_flip_count"] = wall_flips
+        
+        # 6. L1 QUEUE CHANGES
+        # Track volume changes at best bid/ask
+        l1_bid_changes = 0
+        l1_ask_changes = 0
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Track best bid changes
+            if prev_bids and curr_bids:
+                prev_best_bid = prev_bids[0]
+                curr_best_bid = curr_bids[0]
+                
+                # Same price, different volume = queue change
+                if abs(prev_best_bid[0] - curr_best_bid[0]) < 0.01:
+                    if abs(prev_best_bid[1] - curr_best_bid[1]) > 0.01:
+                        l1_bid_changes += 1
+                        self.best_bid_queue_changes.append((curr_ts, curr_best_bid[0], prev_best_bid[1], curr_best_bid[1]))
+            
+            # Track best ask changes
+            if prev_asks and curr_asks:
+                prev_best_ask = prev_asks[0]
+                curr_best_ask = curr_asks[0]
+                
+                # Same price, different volume = queue change
+                if abs(prev_best_ask[0] - curr_best_ask[0]) < 0.01:
+                    if abs(prev_best_ask[1] - curr_best_ask[1]) > 0.01:
+                        l1_ask_changes += 1
+                        self.best_ask_queue_changes.append((curr_ts, curr_best_ask[0], prev_best_ask[1], curr_best_ask[1]))
+        
+        features["l1_bid_queue_changes"] = l1_bid_changes
+        features["l1_ask_queue_changes"] = l1_ask_changes
+        
+        return features
+    
+    def _get_empty_smart_order_features(self) -> Dict[str, Any]:
+        """Return empty values for smart order detection features."""
+        return {
+            "iceberg_order_count": 0,
+            "iceberg_estimated_hidden_volume": 0.0,
+            "peg_order_count": 0,
+            "fake_liquidity_score": 0.0,
+            "front_running_events": 0,
+            "wall_flip_count": 0,
+            "l1_bid_queue_changes": 0,
+            "l1_ask_queue_changes": 0,
         }
     
     def _get_empty_liquidity_vacuum_features(self) -> Dict[str, Any]:
@@ -7045,18 +7304,19 @@ class MarketClient:
             print(f"        Effective Tick Size:    ${new_features.get('effective_tick_size', 0):.2f}")
             
             # Smart Order Detection
+            smart_detection = snapshot.get("smart_order_detection", {})
             print(f"\n     🎯 Smart Order Detection:")
-            print(f"        Iceberg Orders: {new_features.get('iceberg_estimated_count', 0)} (Est. Hidden: {new_features.get('iceberg_estimated_total_size', 0):.2f} BTC)")
-            print(f"        Peg Orders:     {new_features.get('peg_order_count', 0)}")
-            print(f"        Fake Liquidity: {new_features.get('fake_liquidity_score', 0):.1%}")
-            print(f"        Front-Running:  {new_features.get('front_running_events', 0)} events")
+            print(f"        Iceberg Orders: {smart_detection.get('iceberg_order_count', 0)} (Est. Hidden: {smart_detection.get('iceberg_estimated_hidden_volume', 0):.2f} BTC)")
+            print(f"        Peg Orders:     {smart_detection.get('peg_order_count', 0)}")
+            print(f"        Fake Liquidity: {smart_detection.get('fake_liquidity_score', 0):.1%}")
+            print(f"        Front-Running:  {smart_detection.get('front_running_events', 0)} events")
             
             # Liquidity Quality
             print(f"\n     💎 Liquidity Quality:")
             print(f"        Persistent:  {persistent_liq:.1%} (stable orders)")
             print(f"        Transient:   {new_features.get('transient_liquidity_score', 0):.1%} (fleeting orders)")
-            print(f"        Wall Flips:  {new_features.get('wall_flip_count', 0)} (support→resistance or vice versa)")
-            print(f"        L1 Queue Changes: Bid {new_features.get('l1_bid_queue_changes', 0)}, Ask {new_features.get('l1_ask_queue_changes', 0)}")
+            print(f"        Wall Flips:  {smart_detection.get('wall_flip_count', 0)} (support→resistance or vice versa)")
+            print(f"        L1 Queue Changes: Bid {smart_detection.get('l1_bid_queue_changes', 0)}, Ask {smart_detection.get('l1_ask_queue_changes', 0)}")
             
             # Trading Implications
             if persistent_liq > 0.7:
