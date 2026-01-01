@@ -1801,40 +1801,35 @@ class AdvancedOrderFlow:
         features["aggressive_buy_count"] = recent_buy_count
         features["aggressive_sell_count"] = recent_sell_count
         
-        # Trade size percentiles from recent trades
-        if len(self.trade_sizes) > 0:
-            recent_sizes = [size for size in self.trade_sizes if len(self.trade_sizes) > 0]
-            if len(recent_sizes) > 0:
-                sorted_sizes = sorted(recent_sizes)
-                features["trade_size_p50"] = sorted_sizes[len(sorted_sizes) // 2] if len(sorted_sizes) > 0 else 0
-                features["trade_size_p75"] = sorted_sizes[int(len(sorted_sizes) * 0.75)] if len(sorted_sizes) > 0 else 0
-                features["trade_size_p90"] = sorted_sizes[int(len(sorted_sizes) * 0.90)] if len(sorted_sizes) > 0 else 0
-                features["trade_size_p95"] = sorted_sizes[int(len(sorted_sizes) * 0.95)] if len(sorted_sizes) > 0 else 0
-                features["trade_size_p99"] = sorted_sizes[int(len(sorted_sizes) * 0.99)] if len(sorted_sizes) > 0 else 0
+        # Last price from VWAP or depth if available (needed for USD conversion)
+        if self.vwap_30s:
+            last_price = self.vwap_30s
+        elif self.depth_snapshots:
+            _, bids, asks = self.depth_snapshots[-1]
+            if bids and asks:
+                last_price = (bids[0][0] + asks[0][0]) / 2
             else:
-                features["trade_size_p50"] = 0
-                features["trade_size_p75"] = 0
-                features["trade_size_p90"] = 0
-                features["trade_size_p95"] = 0
-                features["trade_size_p99"] = 0
+                last_price = 0
+        else:
+            last_price = 0
+        
+        features["last_price"] = last_price
+        
+        # Trade size percentiles from recent trades (in USD)
+        if len(self.trade_sizes) > 0 and last_price > 0:
+            sorted_sizes = sorted(self.trade_sizes)
+            # Convert BTC amounts to USD by multiplying by last_price
+            features["trade_size_p50"] = sorted_sizes[len(sorted_sizes) // 2] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p75"] = sorted_sizes[int(len(sorted_sizes) * 0.75)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p90"] = sorted_sizes[int(len(sorted_sizes) * 0.90)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p95"] = sorted_sizes[int(len(sorted_sizes) * 0.95)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p99"] = sorted_sizes[int(len(sorted_sizes) * 0.99)] * last_price if len(sorted_sizes) > 0 else 0
         else:
             features["trade_size_p50"] = 0
             features["trade_size_p75"] = 0
             features["trade_size_p90"] = 0
             features["trade_size_p95"] = 0
             features["trade_size_p99"] = 0
-        
-        # Last price from VWAP or depth if available
-        if self.vwap_30s:
-            features["last_price"] = self.vwap_30s
-        elif self.depth_snapshots:
-            _, bids, asks = self.depth_snapshots[-1]
-            if bids and asks:
-                features["last_price"] = (bids[0][0] + asks[0][0]) / 2
-            else:
-                features["last_price"] = 0
-        else:
-            features["last_price"] = 0
         
         return features
     
