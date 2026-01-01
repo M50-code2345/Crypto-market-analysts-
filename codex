@@ -274,6 +274,22 @@ class AdvancedOrderFlow:
         self.tracked_ask_walls = {}                       # price -> (volume, timestamp)
         self.wall_consumption_events = deque(maxlen=500)  # (timestamp, side, price, consumed_vol, remaining_vol)
         
+        # NEW: Depth velocity tracking - measure liquidity appearance/disappearance rates
+        self.depth_velocity_tracker = {}                  # price -> [(timestamp, volume_delta)]
+        self.wall_persistence_tracker = {}                # price -> (first_seen, last_seen, appearances)
+        self.fake_wall_detections = deque(maxlen=200)    # Walls that vanish quickly
+        
+        # NEW: Depth heatmap - track liquidity concentration over time
+        self.depth_heatmap_history = deque(maxlen=300)    # 5 min at 1s intervals: (timestamp, price_bins, volumes)
+        self.liquidity_accumulation_zones = []            # Detected accumulation areas
+        self.liquidity_distribution_zones = []            # Detected distribution areas
+        
+        # NEW: Depth renewal metrics - track wall rebuild behavior
+        self.wall_rebuild_tracker = {}                    # price -> (consumed_time, rebuild_start, rebuild_rate)
+        self.persistent_walls = {}                        # Walls that keep coming back
+        self.transient_walls = {}                         # Walls that disappear permanently
+        self.institutional_wall_signatures = deque(maxlen=100)  # Detected institutional patterns
+        
         # ===== Transaction-Level Intelligence =====
         # Trade imbalance
         self.trade_imbalance = 0.0
@@ -1143,6 +1159,12 @@ class AdvancedOrderFlow:
         # Track liquidity walls and detect consumption (now with filtered data!)
         self._track_wall_consumption(timestamp, bids_filtered, asks_filtered)
         
+        # ENHANCEMENT 2: Track depth velocity for all price levels
+        self.track_depth_velocity(timestamp, bids_filtered, asks_filtered)
+        
+        # ENHANCEMENT 3: Update depth heatmap for pattern detection
+        self.update_depth_heatmap(timestamp, bids_filtered, asks_filtered)
+        
         # Calculate bid/ask stack depth (using filtered data)
         if len(bids_filtered) >= 10:
             bid_stack = sum(q for _, q in bids_filtered[:10])
@@ -1222,6 +1244,9 @@ class AdvancedOrderFlow:
                         self.wall_consumption_events.append((
                             timestamp, "BID", price, vol_change, current_vol, consumption_pct
                         ))
+                        
+                        # ENHANCEMENT 4: Track wall consumption for renewal analysis
+                        self.track_wall_renewal(timestamp, price, "BID", current_vol, is_new=False)
                     
                     # Remove fully consumed walls
                     if current_vol < prev_vol[0] * 0.2:  # <20% remaining
@@ -1233,6 +1258,8 @@ class AdvancedOrderFlow:
             for price, vol in current_bid_walls.items():
                 if price not in self.tracked_bid_walls:
                     self.tracked_bid_walls[price] = (vol, timestamp)
+                    # ENHANCEMENT 4: Track new wall appearance for renewal analysis
+                    self.track_wall_renewal(timestamp, price, "BID", vol, is_new=True)
         
         # Detect and track ask walls (resistance levels) - ENHANCED: Use ALL available levels for complete market picture
         check_levels_ask = len(asks)  # Use ALL available levels (up to 1000+) for comprehensive wall detection
@@ -1263,6 +1290,9 @@ class AdvancedOrderFlow:
                         self.wall_consumption_events.append((
                             timestamp, "ASK", price, vol_change, current_vol, consumption_pct
                         ))
+                        
+                        # ENHANCEMENT 4: Track wall consumption for renewal analysis
+                        self.track_wall_renewal(timestamp, price, "ASK", current_vol, is_new=False)
                     
                     # Remove fully consumed walls
                     if current_vol < prev_vol[0] * 0.2:  # <20% remaining
@@ -1274,6 +1304,192 @@ class AdvancedOrderFlow:
             for price, vol in current_ask_walls.items():
                 if price not in self.tracked_ask_walls:
                     self.tracked_ask_walls[price] = (vol, timestamp)
+                    # ENHANCEMENT 4: Track new wall appearance for renewal analysis
+                    self.track_wall_renewal(timestamp, price, "ASK", vol, is_new=True)
+    
+    def track_depth_velocity(self, timestamp: float, bids: List[Tuple[float, float]], 
+                            asks: List[Tuple[float, float]]):
+        """
+        ENHANCEMENT 2: Track depth velocity - how fast liquidity appears/disappears at each level.
+        Detects fake walls that vanish quickly and measures wall persistence.
+        """
+        # Track bid depth velocity
+        for price, vol in bids:
+            if price not in self.depth_velocity_tracker:
+                self.depth_velocity_tracker[price] = []
+                self.wall_persistence_tracker[price] = (timestamp, timestamp, 1)
+            else:
+                # Get previous volume
+                if self.depth_velocity_tracker[price]:
+                    prev_vol = self.depth_velocity_tracker[price][-1][1]
+                    vol_delta = vol - prev_vol
+                    self.depth_velocity_tracker[price].append((timestamp, vol_delta))
+                    
+                    # Update persistence tracker
+                    first_seen, _, appearances = self.wall_persistence_tracker[price]
+                    self.wall_persistence_tracker[price] = (first_seen, timestamp, appearances + 1)
+                    
+                    # Detect fake walls: large volume that disappears quickly (<5 seconds)
+                    if abs(vol_delta) > vol * 0.5 and vol_delta < 0:  # >50% reduction
+                        time_existed = timestamp - first_seen
+                        if time_existed < 5.0:  # Existed less than 5 seconds
+                            self.fake_wall_detections.append((
+                                timestamp, price, vol, time_existed, "BID"
+                            ))
+        
+        # Track ask depth velocity
+        for price, vol in asks:
+            if price not in self.depth_velocity_tracker:
+                self.depth_velocity_tracker[price] = []
+                self.wall_persistence_tracker[price] = (timestamp, timestamp, 1)
+            else:
+                if self.depth_velocity_tracker[price]:
+                    prev_vol = self.depth_velocity_tracker[price][-1][1]
+                    vol_delta = vol - prev_vol
+                    self.depth_velocity_tracker[price].append((timestamp, vol_delta))
+                    
+                    first_seen, _, appearances = self.wall_persistence_tracker[price]
+                    self.wall_persistence_tracker[price] = (first_seen, timestamp, appearances + 1)
+                    
+                    if abs(vol_delta) > vol * 0.5 and vol_delta < 0:
+                        time_existed = timestamp - first_seen
+                        if time_existed < 5.0:
+                            self.fake_wall_detections.append((
+                                timestamp, price, vol, time_existed, "ASK"
+                            ))
+        
+        # Cleanup old entries (keep only last 30 seconds of velocity data)
+        cutoff_time = timestamp - 30
+        for price in list(self.depth_velocity_tracker.keys()):
+            self.depth_velocity_tracker[price] = [
+                (ts, vol) for ts, vol in self.depth_velocity_tracker[price] if ts >= cutoff_time
+            ]
+            if not self.depth_velocity_tracker[price]:
+                del self.depth_velocity_tracker[price]
+                if price in self.wall_persistence_tracker:
+                    del self.wall_persistence_tracker[price]
+    
+    def update_depth_heatmap(self, timestamp: float, bids: List[Tuple[float, float]], 
+                            asks: List[Tuple[float, float]]):
+        """
+        ENHANCEMENT 3: Create depth heatmap - track liquidity concentration over time.
+        Stores snapshots and detects accumulation/distribution patterns.
+        """
+        if not bids or not asks:
+            return
+        
+        # Create price bins (every $10 for BTC)
+        mid_price = (bids[0][0] + asks[0][0]) / 2
+        bin_size = 10.0  # $10 bins
+        
+        # Aggregate volume into price bins
+        bid_bins = defaultdict(float)
+        ask_bins = defaultdict(float)
+        
+        for price, vol in bids:
+            bin_price = round(price / bin_size) * bin_size
+            bid_bins[bin_price] += vol
+        
+        for price, vol in asks:
+            bin_price = round(price / bin_size) * bin_size
+            ask_bins[bin_price] += vol
+        
+        # Store heatmap snapshot
+        self.depth_heatmap_history.append((timestamp, dict(bid_bins), dict(ask_bins)))
+        
+        # Analyze patterns every 10 snapshots (every ~10 seconds)
+        if len(self.depth_heatmap_history) >= 10 and len(self.depth_heatmap_history) % 10 == 0:
+            self._analyze_liquidity_patterns(timestamp)
+    
+    def _analyze_liquidity_patterns(self, timestamp: float):
+        """Analyze depth heatmap to detect accumulation/distribution zones."""
+        if len(self.depth_heatmap_history) < 30:  # Need at least 30 seconds of data
+            return
+        
+        # Look at last 5 minutes of data
+        recent_snapshots = [s for s in self.depth_heatmap_history if timestamp - s[0] <= 300]
+        
+        if len(recent_snapshots) < 10:
+            return
+        
+        # Aggregate liquidity over time per price bin
+        bid_concentration = defaultdict(list)
+        ask_concentration = defaultdict(list)
+        
+        for ts, bid_bins, ask_bins in recent_snapshots:
+            for price, vol in bid_bins.items():
+                bid_concentration[price].append(vol)
+            for price, vol in ask_bins.items():
+                ask_concentration[price].append(vol)
+        
+        # Detect accumulation: increasing volume over time at specific price levels
+        self.liquidity_accumulation_zones = []
+        for price, volumes in bid_concentration.items():
+            if len(volumes) >= 10:
+                # Calculate trend (simple: compare first half vs second half)
+                mid = len(volumes) // 2
+                first_half_avg = sum(volumes[:mid]) / mid
+                second_half_avg = sum(volumes[mid:]) / (len(volumes) - mid)
+                
+                if second_half_avg > first_half_avg * 1.5:  # 50% increase
+                    self.liquidity_accumulation_zones.append((
+                        price, second_half_avg, "BID", timestamp
+                    ))
+        
+        # Detect distribution: decreasing volume over time
+        self.liquidity_distribution_zones = []
+        for price, volumes in bid_concentration.items():
+            if len(volumes) >= 10:
+                mid = len(volumes) // 2
+                first_half_avg = sum(volumes[:mid]) / mid
+                second_half_avg = sum(volumes[mid:]) / (len(volumes) - mid)
+                
+                if second_half_avg < first_half_avg * 0.5:  # 50% decrease
+                    self.liquidity_distribution_zones.append((
+                        price, second_half_avg, "BID", timestamp
+                    ))
+    
+    def track_wall_renewal(self, timestamp: float, price: float, side: str, 
+                          volume: float, is_new: bool):
+        """
+        ENHANCEMENT 4: Track wall renewal metrics - how walls rebuild after consumption.
+        Identifies persistent vs transient liquidity and institutional patterns.
+        """
+        key = (side, price)
+        
+        if is_new:
+            # Check if this is a rebuild (wall was consumed recently)
+            if key in self.wall_rebuild_tracker:
+                consumed_time, _, _ = self.wall_rebuild_tracker[key]
+                rebuild_delay = timestamp - consumed_time
+                rebuild_rate = volume / rebuild_delay if rebuild_delay > 0 else 0
+                
+                # Update rebuild tracker
+                self.wall_rebuild_tracker[key] = (consumed_time, timestamp, rebuild_rate)
+                
+                # Classify as persistent if rebuilds quickly (<30 seconds)
+                if rebuild_delay < 30:
+                    if key not in self.persistent_walls:
+                        self.persistent_walls[key] = []
+                    self.persistent_walls[key].append((timestamp, volume, rebuild_delay))
+                    
+                    # Detect institutional signature: repeated fast rebuilds
+                    if len(self.persistent_walls[key]) >= 3:
+                        self.institutional_wall_signatures.append((
+                            timestamp, price, side, len(self.persistent_walls[key])
+                        ))
+            else:
+                # First time seeing this wall
+                self.wall_rebuild_tracker[key] = (timestamp, timestamp, 0)
+        else:
+            # Wall was consumed
+            if key in self.wall_rebuild_tracker:
+                self.wall_rebuild_tracker[key] = (timestamp, timestamp, 0)
+            else:
+                # Track as transient if it never rebuilds
+                if key not in self.transient_walls:
+                    self.transient_walls[key] = []
+                self.transient_walls[key].append((timestamp, volume))
     
     def validate_depth_data_quality(self, bids: List[Tuple[float, float]], 
                                    asks: List[Tuple[float, float]]) -> Dict[str, Any]:
@@ -6099,11 +6315,12 @@ class MarketClient:
             top_depth = float(d["b"][0][1]) + float(d["a"][0][1])
             self.top_depth_queue.append((ts_now, top_depth))
 
-            # Feed to Advanced Order Flow - ENHANCED: Use full depth merging
+            # Feed to Advanced Order Flow - ENHANCED: Use ALL available depth data
             if self.advanced_orderflow:
-                # Process top 100 levels from WebSocket
-                bids = [(float(p), float(q)) for p, q in d["b"][:100]]
-                asks = [(float(p), float(q)) for p, q in d["a"][:100]]
+                # ENHANCEMENT 1: Process ALL available levels from WebSocket (up to 1000)
+                # Changed from [:100] to [:1000] to capture complete market depth
+                bids = [(float(p), float(q)) for p, q in d["b"][:1000]]
+                asks = [(float(p), float(q)) for p, q in d["a"][:1000]]
                 
                 # Enable full depth mode to merge with 1000-level REST data
                 self.advanced_orderflow.process_depth_snapshot(ts_now, bids, asks, use_full_depth=True)
@@ -6661,6 +6878,37 @@ class MarketClient:
             print(f"     💡 CONTEXT: Heavy resistance testing - potential breakout if consumption continues")
         elif bid_events and ask_events:
             print(f"     💡 CONTEXT: Both sides tested - range-bound with potential for volatility")
+        
+        # ENHANCEMENT 2: Display fake wall detections
+        recent_fake_walls = [
+            fw for fw in self.advanced_orderflow.fake_wall_detections
+            if current_time - fw[0] <= 30
+        ]
+        if recent_fake_walls:
+            print(f"\n     ⚡ FAKE WALL DETECTIONS (vanished <5s, last 30s):")
+            for ts, price, vol, duration, side in recent_fake_walls[:5]:
+                print(f"        {side}: ${price:,.2f} | {vol:,.4f} BTC | Existed: {duration:.1f}s | ⚠️  SPOOFING SIGNAL")
+        
+        # ENHANCEMENT 3: Display liquidity accumulation/distribution zones
+        if self.advanced_orderflow.liquidity_accumulation_zones:
+            print(f"\n     📈 LIQUIDITY ACCUMULATION ZONES (5-min window):")
+            for price, vol, side, ts in self.advanced_orderflow.liquidity_accumulation_zones[:3]:
+                print(f"        {side} @ ${price:,.2f}: {vol:,.4f} BTC | 🟢 Building position")
+        
+        if self.advanced_orderflow.liquidity_distribution_zones:
+            print(f"\n     📉 LIQUIDITY DISTRIBUTION ZONES (5-min window):")
+            for price, vol, side, ts in self.advanced_orderflow.liquidity_distribution_zones[:3]:
+                print(f"        {side} @ ${price:,.2f}: {vol:,.4f} BTC | 🔴 Liquidating position")
+        
+        # ENHANCEMENT 4: Display institutional wall signatures
+        recent_institutional = [
+            inst for inst in self.advanced_orderflow.institutional_wall_signatures
+            if current_time - inst[0] <= 60
+        ]
+        if recent_institutional:
+            print(f"\n     🏛️  INSTITUTIONAL WALL SIGNATURES (last 60s):")
+            for ts, price, side, rebuild_count in recent_institutional[:3]:
+                print(f"        {side} @ ${price:,.2f} | {rebuild_count} rapid rebuilds | 🎯 INSTITUTIONAL PATTERN")
     
     def _print_advanced_microstructure(self, snapshot):
         """
