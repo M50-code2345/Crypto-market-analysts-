@@ -4250,22 +4250,26 @@ class AdvancedOrderFlow:
         
         vwap_30s = snapshot.get("tier2", {}).get('vwap_30s', latest_price)
         
-        # Calculate approximate buy/sell VWAPs
-        if agg_buy_vol > 0 and agg_sell_vol > 0:
-            # Approximate VWAPs - premium for buyers, discount for sellers
-            buy_vwap = vwap_30s * (1 + (agg_imb_pct / 200))
-            sell_vwap = vwap_30s * (1 - (agg_imb_pct / 200))
+        # Get actual buy/sell VWAPs from tier1 (calculated from real trade data)
+        buy_vwap = snapshot.get("tier1", {}).get('buy_vwap', 0)
+        sell_vwap = snapshot.get("tier1", {}).get('sell_vwap', 0)
+        
+        # Display VWAPs
+        print(f"      Market VWAP:   ${vwap_30s:,.2f}")
+        print(f"      Buy VWAP:      ${buy_vwap:,.2f}")
+        print(f"      Sell VWAP:     ${sell_vwap:,.2f}")
+        
+        # Calculate and display VWAP spread if both VWAPs are available
+        if buy_vwap > 0 and sell_vwap > 0:
             vwap_spread = buy_vwap - sell_vwap
-            
-            print(f"      Market VWAP:   ${vwap_30s:,.2f}")
-            print(f"      Buy VWAP:      ${buy_vwap:,.2f}")
-            print(f"      Sell VWAP:     ${sell_vwap:,.2f}")
             print(f"      VWAP Spread:   ${vwap_spread:,.2f} ({vwap_spread/max(vwap_30s, 1e-8)*10000:.1f} bps)")
             
             if vwap_spread > vwap_30s * 0.001:
                 print(f"         → Buyers paying significant premium")
             elif vwap_spread < -vwap_30s * 0.001:
                 print(f"         → Sellers accepting significant discount")
+        else:
+            print(f"      VWAP Spread:   $0.00 (0.0 bps)")
         
         # ===== SECTION 6: Market Momentum Indicators =====
         print(f"\n   ⚡ MARKET MOMENTUM & DYNAMICS:")
