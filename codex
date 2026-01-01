@@ -1175,7 +1175,7 @@ class AdvancedOrderFlow:
         Track liquidity walls and detect when they're being consumed.
         A wall is considered consumed when its volume decreases by >30%.
         Only tracks walls within ±15% of mid-price for enhanced institutional accuracy.
-        ENHANCED: Now tracks up to 500 levels for deeper wall detection with precise thresholds.
+        ENHANCED: Now scans ALL available depth levels (up to 1000+) for complete market picture.
         """
         # Calculate mid-price for stale wall cleanup
         mid_price = 0.0
@@ -1193,8 +1193,8 @@ class AdvancedOrderFlow:
                 if price - mid_price > max_price_distance:
                     del self.tracked_ask_walls[price]
         
-        # Detect and track bid walls (support levels) - ENHANCED: Check up to 500 levels for maximum precision
-        check_levels = min(500, len(bids))  # Use up to 500 levels if available for deeper scanning
+        # Detect and track bid walls (support levels) - ENHANCED: Use ALL available levels for complete market picture
+        check_levels = len(bids)  # Use ALL available levels (up to 1000+) for comprehensive wall detection
         if check_levels >= 10:
             # Calculate average volume with higher precision using all available levels
             avg_bid_vol = safe_divide(
@@ -1234,8 +1234,8 @@ class AdvancedOrderFlow:
                 if price not in self.tracked_bid_walls:
                     self.tracked_bid_walls[price] = (vol, timestamp)
         
-        # Detect and track ask walls (resistance levels) - ENHANCED: Check up to 500 levels for maximum precision
-        check_levels_ask = min(500, len(asks))  # Use up to 500 levels if available for deeper scanning
+        # Detect and track ask walls (resistance levels) - ENHANCED: Use ALL available levels for complete market picture
+        check_levels_ask = len(asks)  # Use ALL available levels (up to 1000+) for comprehensive wall detection
         if check_levels_ask >= 10:
             # Calculate average volume with higher precision using all available levels
             avg_ask_vol = safe_divide(
@@ -5932,7 +5932,7 @@ class MarketClient:
             # Store in advanced order flow
             if self.advanced_orderflow and bids and asks:
                 self.advanced_orderflow.store_full_depth(bids, asks, timestamp)
-                print(f"[{self.name}] ✅ Fetched full depth: {len(bids)} bids, {len(asks)} asks (1000 levels)")
+                print(f"[{self.name}] ✅ Fetched FULL market depth: {len(bids)} bids, {len(asks)} asks (ALL available levels - max 1000)")
                 
         except Exception as e:
             print(f"[{self.name}] ⚠️  Failed to fetch full depth: {e}")
@@ -6546,7 +6546,7 @@ class MarketClient:
         
         # Print liquidity wall summary with enhanced precision information
         if bid_walls or ask_walls:
-            print(f"  🧱 LIQUIDITY WALLS DETECTED (Precision: 3x avg volume threshold, {len(bid_volumes)} bid levels, {len(ask_volumes)} ask levels):")
+            print(f"  🧱 LIQUIDITY WALLS DETECTED (Scanning ALL {len(bid_volumes)} bid & {len(ask_volumes)} ask levels, 3x threshold):")
             if bid_walls:
                 print(f"     📉 BID WALLS ({len(bid_walls)}) [Avg bid volume: {avg_bid_vol:.4f} BTC]:")
                 for price, vol in bid_walls[:5]:  # Top 5
@@ -6558,7 +6558,7 @@ class MarketClient:
                     multiplier = vol / avg_ask_vol if avg_ask_vol > 0 else 0
                     print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
         else:
-            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book, checked {len(bid_volumes)} bid & {len(ask_volumes)} ask levels)")
+            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book, scanned ALL {len(bid_volumes)} bid & {len(ask_volumes)} ask levels)")
         
         # Print top 10 levels on each side
         print(f"\n  📊 TOP 10 BID LEVELS (Support):")
@@ -7302,12 +7302,13 @@ class MarketClient:
                 beyond_top20_bid = self.advanced_orderflow.depth_beyond_top20.get("bid", 0)
                 beyond_top20_ask = self.advanced_orderflow.depth_beyond_top20.get("ask", 0)
                 
-                print(f"        📊 Full Depth Analysis (1000 levels):")
-                print(f"           Bid Levels: {bid_count} | Ask Levels: {ask_count}")
+                print(f"        📊 Full Depth Analysis (ALL available levels - max 1000):")
+                print(f"           Bid Levels: {bid_count} (complete market depth) | Ask Levels: {ask_count} (complete market depth)")
                 if beyond_top20_bid > 0 or beyond_top20_ask > 0:
-                    print(f"           Liquidity Beyond Top 20:")
+                    print(f"           Deep Liquidity Beyond Top 20:")
                     print(f"              Bids: {beyond_top20_bid:.2f} BTC")
                     print(f"              Asks: {beyond_top20_ask:.2f} BTC")
+                print(f"           ✅ Scanning ALL available depth for comprehensive wall detection")
         
         # Stream synchronization metrics
         if hasattr(self.advanced_orderflow, 'depth_trade_correlation'):
