@@ -1038,6 +1038,7 @@ class AdvancedOrderFlow:
                 asks = sorted(merged_asks, key=lambda x: x[0])[:1000]   # Ascending price
         
         # Apply two-stage price filtering BEFORE any analysis to prevent false alerts
+        # PRECISION IMPROVEMENT: Use wider range (±15% instead of ±10%) for wall detection
         bids_filtered = bids
         asks_filtered = asks
         
@@ -1053,15 +1054,22 @@ class AdvancedOrderFlow:
                 asks_filtered = [(p, q) for p, q in asks 
                                if p <= 999999.0 and p - ref_price <= max_outlier_distance]
                 
-                # Stage 2: Keep valid range (±10% from mid-price)
+                # Stage 2: Keep valid range (±15% from mid-price for better wall visibility)
                 if bids_filtered and asks_filtered:
                     mid_price = (bids_filtered[0][0] + asks_filtered[0][0]) / 2
-                    max_price_distance = mid_price * 0.10
+                    max_price_distance = mid_price * 0.15  # Increased from 0.10 to 0.15 for deeper wall scanning
                     
                     bids_filtered = [(p, q) for p, q in bids_filtered 
                                    if mid_price - p <= max_price_distance]
                     asks_filtered = [(p, q) for p, q in asks_filtered 
                                    if p - mid_price <= max_price_distance]
+        
+        # PRECISION VALIDATION: Check data quality before processing
+        quality_report = self.validate_depth_data_quality(bids_filtered, asks_filtered)
+        if quality_report["data_quality_score"] < 70:
+            # Log quality warnings for debugging
+            if quality_report["warnings"]:
+                print(f"⚠️  Data quality warning (score: {quality_report['data_quality_score']:.0f}/100): {', '.join(quality_report['warnings'][:2])}")
         
         # Use filtered data for all subsequent calculations
         self.depth_snapshots.append((timestamp, bids_filtered, asks_filtered))
@@ -1162,14 +1170,14 @@ class AdvancedOrderFlow:
         """
         Track liquidity walls and detect when they're being consumed.
         A wall is considered consumed when its volume decreases by >30%.
-        Only tracks walls within ±10% of mid-price for institutional accuracy.
-        ENHANCED: Now tracks up to 100 levels for deeper wall detection.
+        Only tracks walls within ±15% of mid-price for enhanced institutional accuracy.
+        ENHANCED: Now tracks up to 500 levels for deeper wall detection with precise thresholds.
         """
         # Calculate mid-price for stale wall cleanup
         mid_price = 0.0
         if bids and asks:
             mid_price = (bids[0][0] + asks[0][0]) / 2
-            max_price_distance = mid_price * 0.10  # ±10% range
+            max_price_distance = mid_price * 0.15  # ±15% range (increased from 10% for deeper scanning)
             
             # Clean up stale bid walls that are too far from current price
             for price in list(self.tracked_bid_walls.keys()):
@@ -1181,15 +1189,19 @@ class AdvancedOrderFlow:
                 if price - mid_price > max_price_distance:
                     del self.tracked_ask_walls[price]
         
-        # Detect and track bid walls (support levels) - ENHANCED: Check up to 100 levels - FIXED: Safe aggregation
-        check_levels = min(100, len(bids))  # Use up to 100 levels if available
+        # Detect and track bid walls (support levels) - ENHANCED: Check up to 500 levels for maximum precision
+        check_levels = min(500, len(bids))  # Use up to 500 levels if available for deeper scanning
         if check_levels >= 10:
+            # Calculate average volume with higher precision using all available levels
             avg_bid_vol = safe_divide(
                 sum(q for _, q in bids[:check_levels]),
                 check_levels,
                 0.0
             )
-            current_bid_walls = {p: q for p, q in bids[:check_levels] if q > avg_bid_vol * 5}
+            # PRECISION IMPROVEMENT: Use 3x threshold for more sensitive wall detection
+            # This catches walls that are 3x average instead of 5x, improving accuracy
+            wall_threshold = avg_bid_vol * 3.0
+            current_bid_walls = {p: q for p, q in bids[:check_levels] if q > wall_threshold}
             
             # Check for wall consumption - FIXED: Safe division
             for price, prev_vol in list(self.tracked_bid_walls.items()):
@@ -1218,15 +1230,19 @@ class AdvancedOrderFlow:
                 if price not in self.tracked_bid_walls:
                     self.tracked_bid_walls[price] = (vol, timestamp)
         
-        # Detect and track ask walls (resistance levels) - ENHANCED: Check up to 100 levels - FIXED: Safe aggregation
-        check_levels_ask = min(100, len(asks))  # Use up to 100 levels if available
+        # Detect and track ask walls (resistance levels) - ENHANCED: Check up to 500 levels for maximum precision
+        check_levels_ask = min(500, len(asks))  # Use up to 500 levels if available for deeper scanning
         if check_levels_ask >= 10:
+            # Calculate average volume with higher precision using all available levels
             avg_ask_vol = safe_divide(
                 sum(q for _, q in asks[:check_levels_ask]),
                 check_levels_ask,
                 0.0
             )
-            current_ask_walls = {p: q for p, q in asks[:check_levels_ask] if q > avg_ask_vol * 5}
+            # PRECISION IMPROVEMENT: Use 3x threshold for more sensitive wall detection
+            # This catches walls that are 3x average instead of 5x, improving accuracy
+            wall_threshold_ask = avg_ask_vol * 3.0
+            current_ask_walls = {p: q for p, q in asks[:check_levels_ask] if q > wall_threshold_ask}
             
             # Check for wall consumption - FIXED: Safe division
             for price, prev_vol in list(self.tracked_ask_walls.items()):
@@ -1254,6 +1270,64 @@ class AdvancedOrderFlow:
             for price, vol in current_ask_walls.items():
                 if price not in self.tracked_ask_walls:
                     self.tracked_ask_walls[price] = (vol, timestamp)
+    
+    def validate_depth_data_quality(self, bids: List[Tuple[float, float]], 
+                                   asks: List[Tuple[float, float]]) -> Dict[str, Any]:
+        """
+        Validate depth data quality for precise wall detection.
+        Returns metrics about data quality and potential issues.
+        """
+        quality_report = {
+            "bid_levels": len(bids),
+            "ask_levels": len(asks),
+            "bid_spread_ok": False,
+            "ask_spread_ok": False,
+            "price_continuity_ok": False,
+            "volume_distribution_ok": False,
+            "data_quality_score": 0.0,
+            "warnings": []
+        }
+        
+        if not bids or not asks:
+            quality_report["warnings"].append("Empty order book data")
+            return quality_report
+        
+        # Check bid-ask spread consistency
+        if bids[0][0] < asks[0][0]:
+            quality_report["bid_spread_ok"] = True
+        else:
+            quality_report["warnings"].append(f"Invalid spread: bid ${bids[0][0]:.2f} >= ask ${asks[0][0]:.2f}")
+        
+        # Check price continuity (gaps shouldn't be too large)
+        if len(bids) >= 10:
+            bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(min(9, len(bids)-1))]
+            avg_bid_gap = sum(bid_gaps) / len(bid_gaps) if bid_gaps else 0
+            max_bid_gap = max(bid_gaps) if bid_gaps else 0
+            if max_bid_gap < avg_bid_gap * 10:  # No huge gaps
+                quality_report["price_continuity_ok"] = True
+            else:
+                quality_report["warnings"].append(f"Large price gap in bids: ${max_bid_gap:.2f}")
+        
+        # Check volume distribution (should have variety, not all same)
+        if len(bids) >= 10:
+            bid_volumes = [q for _, q in bids[:10]]
+            unique_volumes = len(set(round(v, 4) for v in bid_volumes))
+            if unique_volumes >= 5:  # At least 5 different volumes
+                quality_report["volume_distribution_ok"] = True
+            else:
+                quality_report["warnings"].append(f"Suspicious volume uniformity: {unique_volumes} unique values in top 10")
+        
+        # Calculate overall quality score (0-100)
+        score = 0
+        if quality_report["bid_spread_ok"]:
+            score += 40
+        if quality_report["price_continuity_ok"]:
+            score += 30
+        if quality_report["volume_distribution_ok"]:
+            score += 30
+        quality_report["data_quality_score"] = score
+        
+        return quality_report
     
     def process_liquidation(self, timestamp: float, side: str, quantity: float, price: float = 0.0):
         """
@@ -6450,26 +6524,31 @@ class MarketClient:
         bid_volumes = [(bids[i][0], bids[i][1]) for i in range(min(top_n, len(bids)))]
         ask_volumes = [(asks[i][0], asks[i][1]) for i in range(min(top_n, len(asks)))]
         
-        # Detect liquidity walls (orders >5x average size in top 10 levels)
-        avg_bid_vol = sum(v for _, v in bid_volumes[:10]) / 10 if len(bid_volumes) >= 10 else 0
-        avg_ask_vol = sum(v for _, v in ask_volumes[:10]) / 10 if len(ask_volumes) >= 10 else 0
+        # PRECISION IMPROVEMENT: Detect liquidity walls using refined threshold (3x instead of 5x)
+        # Calculate average over more levels for better baseline
+        check_levels = min(20, len(bid_volumes))  # Use top 20 for average calculation
+        avg_bid_vol = sum(v for _, v in bid_volumes[:check_levels]) / check_levels if check_levels >= 10 else 0
+        avg_ask_vol = sum(v for _, v in ask_volumes[:check_levels]) / check_levels if check_levels >= 10 else 0
         
-        bid_walls = [(p, v) for p, v in bid_volumes if v > avg_bid_vol * 5]
-        ask_walls = [(p, v) for p, v in ask_volumes if v > avg_ask_vol * 5]
+        # Use 3x threshold for more sensitive and precise wall detection
+        bid_walls = [(p, v) for p, v in bid_volumes if v > avg_bid_vol * 3.0]
+        ask_walls = [(p, v) for p, v in ask_volumes if v > avg_ask_vol * 3.0]
         
-        # Print liquidity wall summary
+        # Print liquidity wall summary with enhanced precision information
         if bid_walls or ask_walls:
-            print(f"  🧱 LIQUIDITY WALLS DETECTED:")
+            print(f"  🧱 LIQUIDITY WALLS DETECTED (Precision: 3x avg volume threshold, {len(bid_volumes)} bid levels, {len(ask_volumes)} ask levels):")
             if bid_walls:
-                print(f"     📉 BID WALLS ({len(bid_walls)}):")
+                print(f"     📉 BID WALLS ({len(bid_walls)}) [Avg bid volume: {avg_bid_vol:.4f} BTC]:")
                 for price, vol in bid_walls[:5]:  # Top 5
-                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f})")
+                    multiplier = vol / avg_bid_vol if avg_bid_vol > 0 else 0
+                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
             if ask_walls:
-                print(f"     📈 ASK WALLS ({len(ask_walls)}):")
+                print(f"     📈 ASK WALLS ({len(ask_walls)}) [Avg ask volume: {avg_ask_vol:.4f} BTC]:")
                 for price, vol in ask_walls[:5]:  # Top 5
-                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f})")
+                    multiplier = vol / avg_ask_vol if avg_ask_vol > 0 else 0
+                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
         else:
-            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book)")
+            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book, checked {len(bid_volumes)} bid & {len(ask_volumes)} ask levels)")
         
         # Print top 10 levels on each side
         print(f"\n  📊 TOP 10 BID LEVELS (Support):")
