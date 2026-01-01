@@ -135,6 +135,10 @@ class AdvancedOrderFlow:
     Implements comprehensive market microstructure features for advanced order flow analysis.
     """
     
+    # Data quality validation constants
+    DATA_QUALITY_THRESHOLD = 70  # Minimum quality score (0-100) to avoid warnings
+    MIN_UNIQUE_VOLUMES = 5  # Minimum unique volume values for healthy distribution
+    
     def __init__(self, snapshot_interval: int = 30, max_history: int = 100):
         """
         Initialize the Advanced Order Flow Analyzer.
@@ -1066,7 +1070,7 @@ class AdvancedOrderFlow:
         
         # PRECISION VALIDATION: Check data quality before processing
         quality_report = self.validate_depth_data_quality(bids_filtered, asks_filtered)
-        if quality_report["data_quality_score"] < 70:
+        if quality_report["data_quality_score"] < self.DATA_QUALITY_THRESHOLD:
             # Log quality warnings for debugging
             if quality_report["warnings"]:
                 print(f"⚠️  Data quality warning (score: {quality_report['data_quality_score']:.0f}/100): {', '.join(quality_report['warnings'][:2])}")
@@ -1300,9 +1304,11 @@ class AdvancedOrderFlow:
         
         # Check price continuity (gaps shouldn't be too large)
         if len(bids) >= 10:
-            bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(min(9, len(bids)-1))]
-            avg_bid_gap = sum(bid_gaps) / len(bid_gaps) if bid_gaps else 0
-            max_bid_gap = max(bid_gaps) if bid_gaps else 0
+            # Fixed: Ensure we don't access out-of-bounds indices
+            num_gaps = min(9, len(bids) - 1)
+            bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(num_gaps)]
+            avg_bid_gap = safe_mean(bid_gaps, 0.0)
+            max_bid_gap = safe_max(bid_gaps, 0.0)
             if max_bid_gap < avg_bid_gap * 10:  # No huge gaps
                 quality_report["price_continuity_ok"] = True
             else:
@@ -1311,8 +1317,9 @@ class AdvancedOrderFlow:
         # Check volume distribution (should have variety, not all same)
         if len(bids) >= 10:
             bid_volumes = [q for _, q in bids[:10]]
+            # More efficient uniqueness check using rounded values
             unique_volumes = len(set(round(v, 4) for v in bid_volumes))
-            if unique_volumes >= 5:  # At least 5 different volumes
+            if unique_volumes >= self.MIN_UNIQUE_VOLUMES:  # Use class constant
                 quality_report["volume_distribution_ok"] = True
             else:
                 quality_report["warnings"].append(f"Suspicious volume uniformity: {unique_volumes} unique values in top 10")
