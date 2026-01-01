@@ -1815,6 +1815,35 @@ class AdvancedOrderFlow:
         
         features["last_price"] = last_price
         
+        # Calculate Buy VWAP and Sell VWAP from aggressive trade data (last 30 seconds)
+        recent_buy_vwap_data = [data for data in self.aggressive_buy_vwap_data if data[0] >= cutoff_time]
+        recent_sell_vwap_data = [data for data in self.aggressive_sell_vwap_data if data[0] >= cutoff_time]
+        
+        if recent_buy_vwap_data:
+            total_buy_notional = sum(vol * price for _, vol, price in recent_buy_vwap_data)
+            total_buy_vol = sum(vol for _, vol, _ in recent_buy_vwap_data)
+            features["buy_vwap"] = total_buy_notional / total_buy_vol if total_buy_vol > 0 else 0
+        else:
+            features["buy_vwap"] = 0
+        
+        if recent_sell_vwap_data:
+            total_sell_notional = sum(vol * price for _, vol, price in recent_sell_vwap_data)
+            total_sell_vol = sum(vol for _, vol, _ in recent_sell_vwap_data)
+            features["sell_vwap"] = total_sell_notional / total_sell_vol if total_sell_vol > 0 else 0
+        else:
+            features["sell_vwap"] = 0
+        
+        # Cumulative Volume Delta (CVD) - difference between buy and sell volumes
+        features["cum_volume_delta_30s"] = recent_buy_vol - recent_sell_vol
+        
+        # Delta acceleration (rate of change of CVD)
+        # Calculate CVD from previous 30s window for comparison
+        prev_cutoff = cutoff_time - 30
+        prev_buy_vol = sum(vol for ts, vol in self.aggressive_buy_vol if prev_cutoff <= ts < cutoff_time)
+        prev_sell_vol = sum(vol for ts, vol in self.aggressive_sell_vol if prev_cutoff <= ts < cutoff_time)
+        prev_cvd = prev_buy_vol - prev_sell_vol
+        features["delta_acceleration"] = (features["cum_volume_delta_30s"] - prev_cvd) / 30.0 if prev_cutoff >= 0 else 0
+        
         # Trade size percentiles from recent trades (in USD)
         if len(self.trade_sizes) > 0 and last_price > 0:
             sorted_sizes = sorted(self.trade_sizes)
