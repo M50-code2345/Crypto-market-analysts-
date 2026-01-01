@@ -1791,7 +1791,9 @@ class AdvancedOrderFlow:
                 "depth_l20_bid": 0.0,
                 "depth_l20_ask": 0.0,
                 "vwap_30s": 0.0,
-                "avg_spread_30s": 0.0
+                "avg_spread_30s": 0.0,
+                "min_spread_30s": 0.0,
+                "max_spread_30s": 0.0
             }
         
         _, bids, asks = self.depth_snapshots[-1]
@@ -1826,6 +1828,14 @@ class AdvancedOrderFlow:
         # Average spread (30-second)
         recent_spreads = [spread for ts, spread in self.spread_history if ts >= cutoff_time]
         features["avg_spread_30s"] = safe_mean(recent_spreads, 0.0)
+        
+        # Min/Max spread (30-second range)
+        if recent_spreads:
+            features["min_spread_30s"] = min(recent_spreads)
+            features["max_spread_30s"] = max(recent_spreads)
+        else:
+            features["min_spread_30s"] = 0.0
+            features["max_spread_30s"] = 0.0
         
         return features
     
