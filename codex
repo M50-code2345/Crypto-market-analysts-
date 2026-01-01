@@ -2473,9 +2473,10 @@ class AdvancedOrderFlow:
         # Find strongest support (highest bid volume concentration)
         if bid_levels:
             strongest_support = max(bid_levels.items(), key=lambda x: x[1])
-            support_strength = (strongest_support[1] / (total_bid_vol + 1e-8)) * 100
+            support_concentration = (strongest_support[1] / (total_bid_vol + 1e-8))
             features["dynamic_support_price"] = strongest_support[0]
-            features["support_strength_score"] = min(100, support_strength * 10)
+            # FORENSIC FIX: Use sqrt scaling for better distribution (prevents overflow at 100)
+            features["support_strength_score"] = min(100, (support_concentration ** 0.5) * 100)
         else:
             features["dynamic_support_price"] = mid_price * 0.99
             features["support_strength_score"] = 0.0
@@ -2483,17 +2484,24 @@ class AdvancedOrderFlow:
         # Find strongest resistance (highest ask volume concentration)
         if ask_levels:
             strongest_resistance = max(ask_levels.items(), key=lambda x: x[1])
-            resistance_strength = (strongest_resistance[1] / (total_ask_vol + 1e-8)) * 100
+            resistance_concentration = (strongest_resistance[1] / (total_ask_vol + 1e-8))
             features["dynamic_resistance_price"] = strongest_resistance[0]
-            features["resistance_strength_score"] = min(100, resistance_strength * 10)
+            # FORENSIC FIX: Use sqrt scaling for better distribution
+            features["resistance_strength_score"] = min(100, (resistance_concentration ** 0.5) * 100)
         else:
             features["dynamic_resistance_price"] = mid_price * 1.01
             features["resistance_strength_score"] = 0.0
         
         # Volume profile POC (Point of Control)
-        all_levels = list(bid_levels.items()) + list(ask_levels.items())
-        if all_levels:
-            poc = max(all_levels, key=lambda x: x[1])
+        # FORENSIC FIX: Keep separate bid/ask levels, use combined dict for POC only
+        combined_levels = {}
+        for price, vol in bid_levels.items():
+            combined_levels[price] = combined_levels.get(price, 0) + vol
+        for price, vol in ask_levels.items():
+            combined_levels[price] = combined_levels.get(price, 0) + vol
+            
+        if combined_levels:
+            poc = max(combined_levels.items(), key=lambda x: x[1])
             features["volume_profile_poc"] = poc[0]
             features["poc_volume"] = poc[1]
         else:
@@ -2518,10 +2526,11 @@ class AdvancedOrderFlow:
             total_nearby = nearby_bid_vol + nearby_ask_vol
             
             # Calculate attraction strength
-            attraction_strength = (total_nearby / (total_bid_vol + total_ask_vol + 1e-8)) * 100
+            # FORENSIC FIX: Use sqrt scaling to prevent overflow
+            attraction_concentration = (total_nearby / (total_bid_vol + total_ask_vol + 1e-8))
             magnet_scores.append({
                 "price": psy_level,
-                "strength": min(100, attraction_strength * 20),
+                "strength": min(100, (attraction_concentration ** 0.5) * 100),
                 "volume": total_nearby
             })
         
@@ -2570,7 +2579,17 @@ class AdvancedOrderFlow:
                 cumsum = [sum(returns[:i+1]) - (i+1) * mean_return for i in range(len(returns))]
                 R = max(cumsum) - min(cumsum) if cumsum else 0
                 S = std_return
-                hurst_approx = 0.5 if S == 0 else min(1.0, max(0.0, (R / S) / len(returns) ** 0.5))
+                
+                # FORENSIC FIX: Proper Hurst calculation with bounds checking
+                # Use log(R/S) / log(n) formula to prevent overflow
+                n = len(returns)
+                if S > 1e-10 and R > 0 and n > 1:
+                    import math
+                    rs_ratio = R / S
+                    # Hurst = log(R/S) / log(n), bounded to [0, 1]
+                    hurst_approx = min(1.0, max(0.0, math.log(rs_ratio) / math.log(n)))
+                else:
+                    hurst_approx = 0.5
                 
                 features["hurst_exponent"] = hurst_approx
                 features["regime_trend_meanrevert"] = "trending" if hurst_approx > 0.55 else ("mean_reverting" if hurst_approx < 0.45 else "neutral")
@@ -7483,8 +7502,8 @@ class MarketClient:
             # 7. Microstructure Regime
             print(f"\n     📈 Microstructure Regime:")
             print(f"        Trend/Mean-Revert: {hvp.get('regime_trend_meanrevert', 'N/A')} (Hurst: {hvp.get('hurst_exponent', 0):.2f})")
-            print(f"        Volatility: {hvp.get('volatility_regime', 'N/A')}")
-            print(f"        Liquidity: {hvp.get('liquidity_regime', 'N/A')}")
+            print(f"        Volatility: {hvp.get('regime_volatility', 'N/A')} ({hvp.get('volatility_percentile', 50):.0f}th percentile)")
+            print(f"        Liquidity: {hvp.get('regime_liquidity', 'N/A')}")
             
             # 8. Trade Signals
             print(f"\n     🚦 Trade Entry/Exit Signals:")
