@@ -6545,8 +6545,9 @@ class MarketClient:
         ask_walls = [(p, v) for p, v in ask_volumes if v > avg_ask_vol * 3.0]
         
         # Print liquidity wall summary with enhanced precision information
+        # Note: This display shows top levels, but actual wall tracking scans ALL available depth
         if bid_walls or ask_walls:
-            print(f"  🧱 LIQUIDITY WALLS DETECTED (Scanning ALL {len(bid_volumes)} bid & {len(ask_volumes)} ask levels, 3x threshold):")
+            print(f"  🧱 LIQUIDITY WALLS DETECTED (Display: top {len(bid_volumes)} levels shown, Full scanning: ALL available depth):")
             if bid_walls:
                 print(f"     📉 BID WALLS ({len(bid_walls)}) [Avg bid volume: {avg_bid_vol:.4f} BTC]:")
                 for price, vol in bid_walls[:5]:  # Top 5
@@ -6558,7 +6559,7 @@ class MarketClient:
                     multiplier = vol / avg_ask_vol if avg_ask_vol > 0 else 0
                     print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
         else:
-            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book, scanned ALL {len(bid_volumes)} bid & {len(ask_volumes)} ask levels)")
+            print(f"  🧱 LIQUIDITY WALLS: None detected in displayed levels (Full scan: ALL depth analyzed in background)")
         
         # Print top 10 levels on each side
         print(f"\n  📊 TOP 10 BID LEVELS (Support):")
@@ -7303,12 +7304,10 @@ class MarketClient:
                 beyond_top20_ask = self.advanced_orderflow.depth_beyond_top20.get("ask", 0)
                 
                 print(f"        📊 Full Depth Analysis (ALL available levels - max 1000):")
-                print(f"           Bid Levels: {bid_count} (complete market depth) | Ask Levels: {ask_count} (complete market depth)")
+                print(f"           Total Levels: {bid_count} bids, {ask_count} asks")
                 if beyond_top20_bid > 0 or beyond_top20_ask > 0:
                     print(f"           Deep Liquidity Beyond Top 20:")
-                    print(f"              Bids: {beyond_top20_bid:.2f} BTC")
-                    print(f"              Asks: {beyond_top20_ask:.2f} BTC")
-                print(f"           ✅ Scanning ALL available depth for comprehensive wall detection")
+                    print(f"              Bids: {beyond_top20_bid:.2f} BTC | Asks: {beyond_top20_ask:.2f} BTC")
         
         # Stream synchronization metrics
         if hasattr(self.advanced_orderflow, 'depth_trade_correlation'):
