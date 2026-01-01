@@ -33,7 +33,7 @@ def safe_mean(collection, default=0.0):
         return default
     try:
         return statistics.mean(collection)
-    except (StatisticsError, ValueError):
+    except (ValueError, TypeError):
         return default
 
 def safe_std(collection, default=0.0):
@@ -42,7 +42,7 @@ def safe_std(collection, default=0.0):
         return default
     try:
         return statistics.stdev(collection)
-    except (StatisticsError, ValueError):
+    except (ValueError, TypeError):
         return default
 
 def safe_min(collection, default=0.0):
@@ -1303,22 +1303,25 @@ class AdvancedOrderFlow:
             quality_report["warnings"].append(f"Invalid spread: bid ${bids[0][0]:.2f} >= ask ${asks[0][0]:.2f}")
         
         # Check price continuity (gaps shouldn't be too large)
-        if len(bids) >= 10:
-            # Fixed: Ensure we don't access out-of-bounds indices
+        # Ensure we have at least 2 bids to calculate gaps
+        if len(bids) >= 2:
+            # Safe gap calculation - only calculate as many gaps as we have consecutive pairs
             num_gaps = min(9, len(bids) - 1)
-            bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(num_gaps)]
-            avg_bid_gap = safe_mean(bid_gaps, 0.0)
-            max_bid_gap = safe_max(bid_gaps, 0.0)
-            if max_bid_gap < avg_bid_gap * 10:  # No huge gaps
-                quality_report["price_continuity_ok"] = True
-            else:
-                quality_report["warnings"].append(f"Large price gap in bids: ${max_bid_gap:.2f}")
+            if num_gaps > 0:
+                bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(num_gaps)]
+                avg_bid_gap = safe_mean(bid_gaps, 0.0)
+                max_bid_gap = safe_max(bid_gaps, 0.0)
+                if max_bid_gap < avg_bid_gap * 10:  # No huge gaps
+                    quality_report["price_continuity_ok"] = True
+                else:
+                    quality_report["warnings"].append(f"Large price gap in bids: ${max_bid_gap:.2f}")
         
         # Check volume distribution (should have variety, not all same)
         if len(bids) >= 10:
             bid_volumes = [q for _, q in bids[:10]]
-            # More efficient uniqueness check using rounded values
-            unique_volumes = len(set(round(v, 4) for v in bid_volumes))
+            # Efficient uniqueness check - volumes should be different enough
+            # Using set directly for efficiency (goal is to detect suspiciously uniform data)
+            unique_volumes = len(set(bid_volumes))
             if unique_volumes >= self.MIN_UNIQUE_VOLUMES:  # Use class constant
                 quality_report["volume_distribution_ok"] = True
             else:
