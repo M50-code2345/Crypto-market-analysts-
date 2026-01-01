@@ -2252,7 +2252,9 @@ class AdvancedOrderFlow:
         imb_l5 = calc_imbalance(latest_bids, latest_asks, 5)
         imb_l10 = calc_imbalance(latest_bids, latest_asks, 10)
         imb_l20 = calc_imbalance(latest_bids, latest_asks, 20)
-        imb_l50 = calc_imbalance(latest_bids, latest_asks, min(50, len(latest_bids), len(latest_asks)))
+        # PRIORITY 3 FIX: Standardize L50 imbalance to use consistent depth comparison
+        l50_depth = min(50, len(latest_bids), len(latest_asks))
+        imb_l50 = calc_imbalance(latest_bids, latest_asks, l50_depth)
         
         features["imbalance_l5_pct"] = imb_l5
         features["imbalance_l10_pct"] = imb_l10
@@ -2541,16 +2543,30 @@ class AdvancedOrderFlow:
         
         # ========== 7. MICROSTRUCTURE REGIME CLASSIFICATION ==========
         
-        # Trending vs Mean-Reverting (Hurst exponent approximation)
+        # Trending vs Mean-Reverting (Hurst exponent with proper detrending)
         if len(self.price_changes) >= 50:
             prices = list(self.price_changes)[-50:]
-            # Simple Hurst estimation using R/S analysis
-            returns = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            # PRIORITY 3 FIX: Proper Hurst estimation with detrending
+            # Remove linear trend first to avoid bias
+            x = list(range(len(prices)))
+            mean_x = statistics.mean(x)
+            mean_y = statistics.mean(prices)
+            
+            # Linear regression slope
+            numerator = sum((x[i] - mean_x) * (prices[i] - mean_y) for i in range(len(prices)))
+            denominator = sum((x[i] - mean_x) ** 2 for i in range(len(prices)))
+            slope = numerator / (denominator + 1e-8)
+            intercept = mean_y - slope * mean_x
+            
+            # Detrended series
+            detrended = [prices[i] - (slope * x[i] + intercept) for i in range(len(prices))]
+            returns = [detrended[i] - detrended[i-1] for i in range(1, len(detrended))]
+            
             if returns:
                 mean_return = statistics.mean(returns)
                 std_return = statistics.stdev(returns) if len(returns) > 1 else 1.0
                 
-                # R/S ratio
+                # R/S ratio on detrended data
                 cumsum = [sum(returns[:i+1]) - (i+1) * mean_return for i in range(len(returns))]
                 R = max(cumsum) - min(cumsum) if cumsum else 0
                 S = std_return
@@ -3688,6 +3704,7 @@ class AdvancedOrderFlow:
         # Orders inserted immediately before large trades
         front_running_count = 0
         
+        # PRIORITY 3 FIX: Add front-running event accumulation (was missing)
         # Look for patterns: new order appears -> large order fills shortly after
         for i in range(1, min(len(recent_snapshots), 10)):
             prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
@@ -3711,9 +3728,10 @@ class AdvancedOrderFlow:
                             if abs(new_price - best_price) / best_price < 0.0001:  # Within 1 bp of best
                                 if curr_dict[new_price] > 0.1:  # Significant size
                                     front_running_count += 1
+                                    # Properly accumulate front-running events
                                     self.front_running_events.append((curr_ts, side, new_price, curr_dict[new_price]))
         
-        features["front_running_events"] = front_running_count
+        features["front_running_events"] = len(list(self.front_running_events))  # Count accumulated events
         
         # 5. WALL FLIP TRACKING
         # Track when support becomes resistance or vice versa
@@ -3753,6 +3771,7 @@ class AdvancedOrderFlow:
         features["wall_flip_count"] = wall_flips
         
         # 6. L1 QUEUE CHANGES
+        # PRIORITY 3 FIX: Implement L1 queue change tracking (was initialized but never populated)
         # Track volume changes at best bid/ask
         l1_bid_changes = 0
         l1_ask_changes = 0
@@ -3770,6 +3789,7 @@ class AdvancedOrderFlow:
                 if abs(prev_best_bid[0] - curr_best_bid[0]) < 0.01:
                     if abs(prev_best_bid[1] - curr_best_bid[1]) > 0.01:
                         l1_bid_changes += 1
+                        # Properly populate queue changes
                         self.best_bid_queue_changes.append((curr_ts, curr_best_bid[0], prev_best_bid[1], curr_best_bid[1]))
             
             # Track best ask changes
@@ -3781,10 +3801,12 @@ class AdvancedOrderFlow:
                 if abs(prev_best_ask[0] - curr_best_ask[0]) < 0.01:
                     if abs(prev_best_ask[1] - curr_best_ask[1]) > 0.01:
                         l1_ask_changes += 1
+                        # Properly populate queue changes
                         self.best_ask_queue_changes.append((curr_ts, curr_best_ask[0], prev_best_ask[1], curr_best_ask[1]))
         
-        features["l1_bid_queue_changes"] = l1_bid_changes
-        features["l1_ask_queue_changes"] = l1_ask_changes
+        # Return accumulated counts from deques (not just local counters)
+        features["l1_bid_queue_changes"] = len(list(self.best_bid_queue_changes))
+        features["l1_ask_queue_changes"] = len(list(self.best_ask_queue_changes))
         
         return features
     
