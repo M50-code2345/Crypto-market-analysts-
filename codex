@@ -2225,7 +2225,10 @@ class AdvancedOrderFlow:
             if len(spreads) >= 2:
                 spread_change = spreads[-1] - spreads[0]
                 time_diff = timestamps[-1] - timestamps[0]
-                spread_velocity_bps_per_sec = (spread_change / (spreads[0] + 1e-8)) * 10000 / (time_diff + 1e-8)
+                # FIX: Calculate velocity relative to mid-price, not spread itself
+                # Get mid-price from first snapshot to normalize
+                first_mid = (recent_snapshots[-10][1][0][0] + recent_snapshots[-10][2][0][0]) / 2 if recent_snapshots[-10][1] and recent_snapshots[-10][2] else 1.0
+                spread_velocity_bps_per_sec = (spread_change / (first_mid + 1e-8)) * 10000 / (time_diff + 1e-8)
                 features["spread_velocity_bps_per_sec"] = spread_velocity_bps_per_sec
                 features["spread_trend"] = "narrowing" if spread_change < 0 else ("widening" if spread_change > 0 else "stable")
             else:
@@ -2257,13 +2260,17 @@ class AdvancedOrderFlow:
         # Imbalance momentum (rate of change)
         if len(recent_snapshots) >= 10:
             imbalances = []
+            timestamps_imb = []
             for ts, bids, asks in recent_snapshots[-10:]:
                 if bids and asks:
                     imbalances.append(calc_imbalance(bids, asks, 10))
+                    timestamps_imb.append(ts)
             
-            if len(imbalances) >= 2:
+            if len(imbalances) >= 2 and len(timestamps_imb) >= 2:
                 imb_change = imbalances[-1] - imbalances[0]
-                features["imbalance_momentum_pct_per_sec"] = imb_change / (len(recent_snapshots) * 0.1 + 1e-8)
+                # FIX: Use actual timestamp difference instead of assuming 0.1s per snapshot
+                time_diff_imb = timestamps_imb[-1] - timestamps_imb[0]
+                features["imbalance_momentum_pct_per_sec"] = imb_change / (time_diff_imb + 1e-8)
                 features["imbalance_acceleration"] = "accelerating_bid" if imb_change > 2 else ("accelerating_ask" if imb_change < -2 else "stable")
             else:
                 features["imbalance_momentum_pct_per_sec"] = 0.0
@@ -3512,8 +3519,8 @@ class AdvancedOrderFlow:
         features["iceberg_order_count"] = len(confirmed_icebergs)
         features["iceberg_estimated_hidden_volume"] = sum(v["total_regen_vol"] for v in confirmed_icebergs.values())
         
-        # Update class state
-        self.iceberg_size_estimate = {v["price"]: v["total_regen_vol"] for v in confirmed_icebergs.values()}
+        # Update class state with compound key (side, price) to prevent overwriting
+        self.iceberg_size_estimate = {k: v["total_regen_vol"] for k, v in confirmed_icebergs.items()}
         
         # 2. PEG ORDER DETECTION
         # Orders that move with mid-price (maintain relative distance)
@@ -3571,7 +3578,7 @@ class AdvancedOrderFlow:
             curr_ts, curr_bids, curr_asks = recent_snapshots[i]
             
             # Check both sides
-            for prev_levels, curr_levels in [(prev_bids, curr_bids), (prev_asks, curr_asks)]:
+            for side_name, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
                 prev_dict = {p: q for p, q in prev_levels[:20]}
                 curr_dict = {p: q for p, q in curr_levels[:20]}
                 
@@ -3590,6 +3597,11 @@ class AdvancedOrderFlow:
                         
                         if distance_pct > 0.0002:  # > 2 bps from best
                             cancelled_before_fill += 1
+                            
+                            # FIX: Accumulate spoofing events for large cancelled orders
+                            # Large orders (>1.0 BTC) cancelled away from best price suggest spoofing
+                            if prev_dict[price] > 1.0:
+                                self.spoofing_events.append((curr_ts, side_name, price, prev_dict[price]))
         
         fake_liquidity_ratio = cancelled_before_fill / (total_disappeared + 1e-8)
         features["fake_liquidity_score"] = min(fake_liquidity_ratio, 1.0)
