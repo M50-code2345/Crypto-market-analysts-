@@ -4236,7 +4236,7 @@ class AdvancedOrderFlow:
             print(f"      Market VWAP:   ${vwap_30s:,.2f}")
             print(f"      Buy VWAP:      ${buy_vwap:,.2f}")
             print(f"      Sell VWAP:     ${sell_vwap:,.2f}")
-            print(f"      VWAP Spread:   ${vwap_spread:,.2f} ({vwap_spread/vwap_30s*10000:.1f} bps)")
+            print(f"      VWAP Spread:   ${vwap_spread:,.2f} ({vwap_spread/max(vwap_30s, 1e-8)*10000:.1f} bps)")
             
             if vwap_spread > vwap_30s * 0.001:
                 print(f"         → Buyers paying significant premium")
