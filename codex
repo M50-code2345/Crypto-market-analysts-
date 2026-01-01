@@ -2432,7 +2432,8 @@ class AdvancedOrderFlow:
         magnet_velocity = 0.0
         if len(self.depth_snapshots) >= 2:
             # depth_snapshots stores tuples: (timestamp, bids, asks)
-            _, prev_bids, prev_asks = self.depth_snapshots[-2]
+            prev_timestamp, prev_bids, prev_asks = self.depth_snapshots[-2]
+            latest_timestamp = recent_snapshots[-1][0]
             
             if prev_bids and prev_asks and magnet_levels:
                 # Check volume change at strongest magnet
@@ -2444,7 +2445,7 @@ class AdvancedOrderFlow:
                 prev_vol_near_magnet += sum(q for p, q in prev_asks if abs(p - magnet_price) < magnet_range)
                 
                 current_vol = strongest_magnet["total_volume"]
-                time_diff = (latest_snapshot.get("timestamp", 0) - prev_snapshot.get("timestamp", 0))
+                time_diff = latest_timestamp - prev_timestamp
                 
                 if time_diff > 0:
                     magnet_velocity = (current_vol - prev_vol_near_magnet) / time_diff
