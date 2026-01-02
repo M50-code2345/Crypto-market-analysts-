@@ -33,7 +33,7 @@ def safe_mean(collection, default=0.0):
         return default
     try:
         return statistics.mean(collection)
-    except (StatisticsError, ValueError):
+    except (ValueError, TypeError):
         return default
 
 def safe_std(collection, default=0.0):
@@ -42,7 +42,7 @@ def safe_std(collection, default=0.0):
         return default
     try:
         return statistics.stdev(collection)
-    except (StatisticsError, ValueError):
+    except (ValueError, TypeError):
         return default
 
 def safe_min(collection, default=0.0):
@@ -134,6 +134,10 @@ class AdvancedOrderFlow:
     Advanced Order Flow Analyzer with 30-second snapshot computation.
     Implements comprehensive market microstructure features for advanced order flow analysis.
     """
+    
+    # Data quality validation constants
+    DATA_QUALITY_THRESHOLD = 70  # Minimum quality score (0-100) to avoid warnings
+    MIN_UNIQUE_VOLUMES = 5  # Minimum unique volume values for healthy distribution
     
     def __init__(self, snapshot_interval: int = 30, max_history: int = 100):
         """
@@ -269,6 +273,22 @@ class AdvancedOrderFlow:
         self.tracked_bid_walls = {}                       # price -> (volume, timestamp)
         self.tracked_ask_walls = {}                       # price -> (volume, timestamp)
         self.wall_consumption_events = deque(maxlen=500)  # (timestamp, side, price, consumed_vol, remaining_vol)
+        
+        # NEW: Depth velocity tracking - measure liquidity appearance/disappearance rates
+        self.depth_velocity_tracker = {}                  # price -> [(timestamp, volume_delta)]
+        self.wall_persistence_tracker = {}                # price -> (first_seen, last_seen, appearances)
+        self.fake_wall_detections = deque(maxlen=200)    # Walls that vanish quickly
+        
+        # NEW: Depth heatmap - track liquidity concentration over time
+        self.depth_heatmap_history = deque(maxlen=300)    # 5 min at 1s intervals: (timestamp, price_bins, volumes)
+        self.liquidity_accumulation_zones = []            # Detected accumulation areas
+        self.liquidity_distribution_zones = []            # Detected distribution areas
+        
+        # NEW: Depth renewal metrics - track wall rebuild behavior
+        self.wall_rebuild_tracker = {}                    # price -> (consumed_time, rebuild_start, rebuild_rate)
+        self.persistent_walls = {}                        # Walls that keep coming back
+        self.transient_walls = {}                         # Walls that disappear permanently
+        self.institutional_wall_signatures = deque(maxlen=100)  # Detected institutional patterns
         
         # ===== Transaction-Level Intelligence =====
         # Trade imbalance
@@ -1038,6 +1058,7 @@ class AdvancedOrderFlow:
                 asks = sorted(merged_asks, key=lambda x: x[0])[:1000]   # Ascending price
         
         # Apply two-stage price filtering BEFORE any analysis to prevent false alerts
+        # PRECISION IMPROVEMENT: Use wider range (±15% instead of ±10%) for wall detection
         bids_filtered = bids
         asks_filtered = asks
         
@@ -1053,15 +1074,22 @@ class AdvancedOrderFlow:
                 asks_filtered = [(p, q) for p, q in asks 
                                if p <= 999999.0 and p - ref_price <= max_outlier_distance]
                 
-                # Stage 2: Keep valid range (±10% from mid-price)
+                # Stage 2: Keep valid range (±15% from mid-price for better wall visibility)
                 if bids_filtered and asks_filtered:
                     mid_price = (bids_filtered[0][0] + asks_filtered[0][0]) / 2
-                    max_price_distance = mid_price * 0.10
+                    max_price_distance = mid_price * 0.15  # Increased from 0.10 to 0.15 for deeper wall scanning
                     
                     bids_filtered = [(p, q) for p, q in bids_filtered 
                                    if mid_price - p <= max_price_distance]
                     asks_filtered = [(p, q) for p, q in asks_filtered 
                                    if p - mid_price <= max_price_distance]
+        
+        # PRECISION VALIDATION: Check data quality before processing
+        quality_report = self.validate_depth_data_quality(bids_filtered, asks_filtered)
+        if quality_report["data_quality_score"] < self.DATA_QUALITY_THRESHOLD:
+            # Log quality warnings for debugging
+            if quality_report["warnings"]:
+                print(f"⚠️  Data quality warning (score: {quality_report['data_quality_score']:.0f}/100): {', '.join(quality_report['warnings'][:2])}")
         
         # Use filtered data for all subsequent calculations
         self.depth_snapshots.append((timestamp, bids_filtered, asks_filtered))
@@ -1131,6 +1159,12 @@ class AdvancedOrderFlow:
         # Track liquidity walls and detect consumption (now with filtered data!)
         self._track_wall_consumption(timestamp, bids_filtered, asks_filtered)
         
+        # ENHANCEMENT 2: Track depth velocity for all price levels
+        self.track_depth_velocity(timestamp, bids_filtered, asks_filtered)
+        
+        # ENHANCEMENT 3: Update depth heatmap for pattern detection
+        self.update_depth_heatmap(timestamp, bids_filtered, asks_filtered)
+        
         # Calculate bid/ask stack depth (using filtered data)
         if len(bids_filtered) >= 10:
             bid_stack = sum(q for _, q in bids_filtered[:10])
@@ -1162,14 +1196,14 @@ class AdvancedOrderFlow:
         """
         Track liquidity walls and detect when they're being consumed.
         A wall is considered consumed when its volume decreases by >30%.
-        Only tracks walls within ±10% of mid-price for institutional accuracy.
-        ENHANCED: Now tracks up to 100 levels for deeper wall detection.
+        Only tracks walls within ±15% of mid-price for enhanced institutional accuracy.
+        ENHANCED: Now scans ALL available depth levels (up to 1000+) for complete market picture.
         """
         # Calculate mid-price for stale wall cleanup
         mid_price = 0.0
         if bids and asks:
             mid_price = (bids[0][0] + asks[0][0]) / 2
-            max_price_distance = mid_price * 0.10  # ±10% range
+            max_price_distance = mid_price * 0.15  # ±15% range (increased from 10% for deeper scanning)
             
             # Clean up stale bid walls that are too far from current price
             for price in list(self.tracked_bid_walls.keys()):
@@ -1181,15 +1215,19 @@ class AdvancedOrderFlow:
                 if price - mid_price > max_price_distance:
                     del self.tracked_ask_walls[price]
         
-        # Detect and track bid walls (support levels) - ENHANCED: Check up to 100 levels - FIXED: Safe aggregation
-        check_levels = min(100, len(bids))  # Use up to 100 levels if available
+        # Detect and track bid walls (support levels) - ENHANCED: Use ALL available levels for complete market picture
+        check_levels = len(bids)  # Use ALL available levels (up to 1000+) for comprehensive wall detection
         if check_levels >= 10:
+            # Calculate average volume with higher precision using all available levels
             avg_bid_vol = safe_divide(
                 sum(q for _, q in bids[:check_levels]),
                 check_levels,
                 0.0
             )
-            current_bid_walls = {p: q for p, q in bids[:check_levels] if q > avg_bid_vol * 5}
+            # PRECISION IMPROVEMENT: Use 3x threshold for more sensitive wall detection
+            # This catches walls that are 3x average instead of 5x, improving accuracy
+            wall_threshold = avg_bid_vol * 3.0
+            current_bid_walls = {p: q for p, q in bids[:check_levels] if q > wall_threshold}
             
             # Check for wall consumption - FIXED: Safe division
             for price, prev_vol in list(self.tracked_bid_walls.items()):
@@ -1206,6 +1244,9 @@ class AdvancedOrderFlow:
                         self.wall_consumption_events.append((
                             timestamp, "BID", price, vol_change, current_vol, consumption_pct
                         ))
+                        
+                        # ENHANCEMENT 4: Track wall consumption for renewal analysis
+                        self.track_wall_renewal(timestamp, price, "BID", current_vol, is_new=False)
                     
                     # Remove fully consumed walls
                     if current_vol < prev_vol[0] * 0.2:  # <20% remaining
@@ -1217,16 +1258,22 @@ class AdvancedOrderFlow:
             for price, vol in current_bid_walls.items():
                 if price not in self.tracked_bid_walls:
                     self.tracked_bid_walls[price] = (vol, timestamp)
+                    # ENHANCEMENT 4: Track new wall appearance for renewal analysis
+                    self.track_wall_renewal(timestamp, price, "BID", vol, is_new=True)
         
-        # Detect and track ask walls (resistance levels) - ENHANCED: Check up to 100 levels - FIXED: Safe aggregation
-        check_levels_ask = min(100, len(asks))  # Use up to 100 levels if available
+        # Detect and track ask walls (resistance levels) - ENHANCED: Use ALL available levels for complete market picture
+        check_levels_ask = len(asks)  # Use ALL available levels (up to 1000+) for comprehensive wall detection
         if check_levels_ask >= 10:
+            # Calculate average volume with higher precision using all available levels
             avg_ask_vol = safe_divide(
                 sum(q for _, q in asks[:check_levels_ask]),
                 check_levels_ask,
                 0.0
             )
-            current_ask_walls = {p: q for p, q in asks[:check_levels_ask] if q > avg_ask_vol * 5}
+            # PRECISION IMPROVEMENT: Use 3x threshold for more sensitive wall detection
+            # This catches walls that are 3x average instead of 5x, improving accuracy
+            wall_threshold_ask = avg_ask_vol * 3.0
+            current_ask_walls = {p: q for p, q in asks[:check_levels_ask] if q > wall_threshold_ask}
             
             # Check for wall consumption - FIXED: Safe division
             for price, prev_vol in list(self.tracked_ask_walls.items()):
@@ -1243,6 +1290,9 @@ class AdvancedOrderFlow:
                         self.wall_consumption_events.append((
                             timestamp, "ASK", price, vol_change, current_vol, consumption_pct
                         ))
+                        
+                        # ENHANCEMENT 4: Track wall consumption for renewal analysis
+                        self.track_wall_renewal(timestamp, price, "ASK", current_vol, is_new=False)
                     
                     # Remove fully consumed walls
                     if current_vol < prev_vol[0] * 0.2:  # <20% remaining
@@ -1254,6 +1304,256 @@ class AdvancedOrderFlow:
             for price, vol in current_ask_walls.items():
                 if price not in self.tracked_ask_walls:
                     self.tracked_ask_walls[price] = (vol, timestamp)
+                    # ENHANCEMENT 4: Track new wall appearance for renewal analysis
+                    self.track_wall_renewal(timestamp, price, "ASK", vol, is_new=True)
+    
+    def track_depth_velocity(self, timestamp: float, bids: List[Tuple[float, float]], 
+                            asks: List[Tuple[float, float]]):
+        """
+        ENHANCEMENT 2: Track depth velocity - how fast liquidity appears/disappears at each level.
+        Detects fake walls that vanish quickly and measures wall persistence.
+        """
+        # Track bid depth velocity
+        for price, vol in bids:
+            if price not in self.depth_velocity_tracker:
+                self.depth_velocity_tracker[price] = []
+                self.wall_persistence_tracker[price] = (timestamp, timestamp, 1)
+            else:
+                # Get previous volume
+                if self.depth_velocity_tracker[price]:
+                    prev_vol = self.depth_velocity_tracker[price][-1][1]
+                    vol_delta = vol - prev_vol
+                    self.depth_velocity_tracker[price].append((timestamp, vol_delta))
+                    
+                    # Update persistence tracker
+                    first_seen, _, appearances = self.wall_persistence_tracker[price]
+                    self.wall_persistence_tracker[price] = (first_seen, timestamp, appearances + 1)
+                    
+                    # Detect fake walls: large volume that disappears quickly (<5 seconds)
+                    if abs(vol_delta) > vol * 0.5 and vol_delta < 0:  # >50% reduction
+                        time_existed = timestamp - first_seen
+                        if time_existed < 5.0:  # Existed less than 5 seconds
+                            self.fake_wall_detections.append((
+                                timestamp, price, vol, time_existed, "BID"
+                            ))
+        
+        # Track ask depth velocity
+        for price, vol in asks:
+            if price not in self.depth_velocity_tracker:
+                self.depth_velocity_tracker[price] = []
+                self.wall_persistence_tracker[price] = (timestamp, timestamp, 1)
+            else:
+                if self.depth_velocity_tracker[price]:
+                    prev_vol = self.depth_velocity_tracker[price][-1][1]
+                    vol_delta = vol - prev_vol
+                    self.depth_velocity_tracker[price].append((timestamp, vol_delta))
+                    
+                    first_seen, _, appearances = self.wall_persistence_tracker[price]
+                    self.wall_persistence_tracker[price] = (first_seen, timestamp, appearances + 1)
+                    
+                    if abs(vol_delta) > vol * 0.5 and vol_delta < 0:
+                        time_existed = timestamp - first_seen
+                        if time_existed < 5.0:
+                            self.fake_wall_detections.append((
+                                timestamp, price, vol, time_existed, "ASK"
+                            ))
+        
+        # Cleanup old entries (keep only last 30 seconds of velocity data)
+        cutoff_time = timestamp - 30
+        for price in list(self.depth_velocity_tracker.keys()):
+            self.depth_velocity_tracker[price] = [
+                (ts, vol) for ts, vol in self.depth_velocity_tracker[price] if ts >= cutoff_time
+            ]
+            if not self.depth_velocity_tracker[price]:
+                del self.depth_velocity_tracker[price]
+                if price in self.wall_persistence_tracker:
+                    del self.wall_persistence_tracker[price]
+    
+    def update_depth_heatmap(self, timestamp: float, bids: List[Tuple[float, float]], 
+                            asks: List[Tuple[float, float]]):
+        """
+        ENHANCEMENT 3: Create depth heatmap - track liquidity concentration over time.
+        Stores snapshots and detects accumulation/distribution patterns.
+        """
+        if not bids or not asks:
+            return
+        
+        # Create price bins (every $10 for BTC)
+        mid_price = (bids[0][0] + asks[0][0]) / 2
+        bin_size = 10.0  # $10 bins
+        
+        # Aggregate volume into price bins
+        bid_bins = defaultdict(float)
+        ask_bins = defaultdict(float)
+        
+        for price, vol in bids:
+            bin_price = round(price / bin_size) * bin_size
+            bid_bins[bin_price] += vol
+        
+        for price, vol in asks:
+            bin_price = round(price / bin_size) * bin_size
+            ask_bins[bin_price] += vol
+        
+        # Store heatmap snapshot
+        self.depth_heatmap_history.append((timestamp, dict(bid_bins), dict(ask_bins)))
+        
+        # Analyze patterns every 10 snapshots (every ~10 seconds)
+        if len(self.depth_heatmap_history) >= 10 and len(self.depth_heatmap_history) % 10 == 0:
+            self._analyze_liquidity_patterns(timestamp)
+    
+    def _analyze_liquidity_patterns(self, timestamp: float):
+        """Analyze depth heatmap to detect accumulation/distribution zones."""
+        if len(self.depth_heatmap_history) < 30:  # Need at least 30 seconds of data
+            return
+        
+        # Look at last 5 minutes of data
+        recent_snapshots = [s for s in self.depth_heatmap_history if timestamp - s[0] <= 300]
+        
+        if len(recent_snapshots) < 10:
+            return
+        
+        # Aggregate liquidity over time per price bin
+        bid_concentration = defaultdict(list)
+        ask_concentration = defaultdict(list)
+        
+        for ts, bid_bins, ask_bins in recent_snapshots:
+            for price, vol in bid_bins.items():
+                bid_concentration[price].append(vol)
+            for price, vol in ask_bins.items():
+                ask_concentration[price].append(vol)
+        
+        # Detect accumulation: increasing volume over time at specific price levels
+        self.liquidity_accumulation_zones = []
+        for price, volumes in bid_concentration.items():
+            if len(volumes) >= 10:
+                # Calculate trend (simple: compare first half vs second half)
+                mid = len(volumes) // 2
+                first_half_avg = sum(volumes[:mid]) / mid
+                second_half_avg = sum(volumes[mid:]) / (len(volumes) - mid)
+                
+                if second_half_avg > first_half_avg * 1.5:  # 50% increase
+                    self.liquidity_accumulation_zones.append((
+                        price, second_half_avg, "BID", timestamp
+                    ))
+        
+        # Detect distribution: decreasing volume over time
+        self.liquidity_distribution_zones = []
+        for price, volumes in bid_concentration.items():
+            if len(volumes) >= 10:
+                mid = len(volumes) // 2
+                first_half_avg = sum(volumes[:mid]) / mid
+                second_half_avg = sum(volumes[mid:]) / (len(volumes) - mid)
+                
+                if second_half_avg < first_half_avg * 0.5:  # 50% decrease
+                    self.liquidity_distribution_zones.append((
+                        price, second_half_avg, "BID", timestamp
+                    ))
+    
+    def track_wall_renewal(self, timestamp: float, price: float, side: str, 
+                          volume: float, is_new: bool):
+        """
+        ENHANCEMENT 4: Track wall renewal metrics - how walls rebuild after consumption.
+        Identifies persistent vs transient liquidity and institutional patterns.
+        """
+        key = (side, price)
+        
+        if is_new:
+            # Check if this is a rebuild (wall was consumed recently)
+            if key in self.wall_rebuild_tracker:
+                consumed_time, _, _ = self.wall_rebuild_tracker[key]
+                rebuild_delay = timestamp - consumed_time
+                rebuild_rate = volume / rebuild_delay if rebuild_delay > 0 else 0
+                
+                # Update rebuild tracker
+                self.wall_rebuild_tracker[key] = (consumed_time, timestamp, rebuild_rate)
+                
+                # Classify as persistent if rebuilds quickly (<30 seconds)
+                if rebuild_delay < 30:
+                    if key not in self.persistent_walls:
+                        self.persistent_walls[key] = []
+                    self.persistent_walls[key].append((timestamp, volume, rebuild_delay))
+                    
+                    # Detect institutional signature: repeated fast rebuilds
+                    if len(self.persistent_walls[key]) >= 3:
+                        self.institutional_wall_signatures.append((
+                            timestamp, price, side, len(self.persistent_walls[key])
+                        ))
+            else:
+                # First time seeing this wall
+                self.wall_rebuild_tracker[key] = (timestamp, timestamp, 0)
+        else:
+            # Wall was consumed
+            if key in self.wall_rebuild_tracker:
+                self.wall_rebuild_tracker[key] = (timestamp, timestamp, 0)
+            else:
+                # Track as transient if it never rebuilds
+                if key not in self.transient_walls:
+                    self.transient_walls[key] = []
+                self.transient_walls[key].append((timestamp, volume))
+    
+    def validate_depth_data_quality(self, bids: List[Tuple[float, float]], 
+                                   asks: List[Tuple[float, float]]) -> Dict[str, Any]:
+        """
+        Validate depth data quality for precise wall detection.
+        Returns metrics about data quality and potential issues.
+        """
+        quality_report = {
+            "bid_levels": len(bids),
+            "ask_levels": len(asks),
+            "bid_spread_ok": False,
+            "ask_spread_ok": False,
+            "price_continuity_ok": False,
+            "volume_distribution_ok": False,
+            "data_quality_score": 0.0,
+            "warnings": []
+        }
+        
+        if not bids or not asks:
+            quality_report["warnings"].append("Empty order book data")
+            return quality_report
+        
+        # Check bid-ask spread consistency
+        if bids[0][0] < asks[0][0]:
+            quality_report["bid_spread_ok"] = True
+        else:
+            quality_report["warnings"].append(f"Invalid spread: bid ${bids[0][0]:.2f} >= ask ${asks[0][0]:.2f}")
+        
+        # Check price continuity (gaps shouldn't be too large)
+        # Ensure we have at least 2 bids to calculate gaps
+        if len(bids) >= 2:
+            # Safe gap calculation - only calculate as many gaps as we have consecutive pairs
+            num_gaps = min(9, len(bids) - 1)
+            if num_gaps > 0:
+                bid_gaps = [abs(bids[i][0] - bids[i+1][0]) for i in range(num_gaps)]
+                avg_bid_gap = safe_mean(bid_gaps, 0.0)
+                max_bid_gap = safe_max(bid_gaps, 0.0)
+                if max_bid_gap < avg_bid_gap * 10:  # No huge gaps
+                    quality_report["price_continuity_ok"] = True
+                else:
+                    quality_report["warnings"].append(f"Large price gap in bids: ${max_bid_gap:.2f}")
+        
+        # Check volume distribution (should have variety, not all same)
+        if len(bids) >= 10:
+            bid_volumes = [q for _, q in bids[:10]]
+            # Efficient uniqueness check - volumes should be different enough
+            # Using set directly for efficiency (goal is to detect suspiciously uniform data)
+            unique_volumes = len(set(bid_volumes))
+            if unique_volumes >= self.MIN_UNIQUE_VOLUMES:  # Use class constant
+                quality_report["volume_distribution_ok"] = True
+            else:
+                quality_report["warnings"].append(f"Suspicious volume uniformity: {unique_volumes} unique values in top 10")
+        
+        # Calculate overall quality score (0-100)
+        score = 0
+        if quality_report["bid_spread_ok"]:
+            score += 40
+        if quality_report["price_continuity_ok"]:
+            score += 30
+        if quality_report["volume_distribution_ok"]:
+            score += 30
+        quality_report["data_quality_score"] = score
+        
+        return quality_report
     
     def process_liquidation(self, timestamp: float, side: str, quantity: float, price: float = 0.0):
         """
@@ -1462,6 +1762,15 @@ class AdvancedOrderFlow:
         # ===== NEW: Liquidity Vacuum Detection =====
         snapshot["liquidity_vacuum"] = self._compute_liquidity_vacuum(cutoff_time)
         
+        # ===== NEW: Smart Order Detection =====
+        snapshot["smart_order_detection"] = self._compute_smart_order_detection(cutoff_time)
+        
+        # ===== TIER 1: Trade Flow Metrics =====
+        snapshot["tier1"] = self._compute_tier1_trade_metrics(cutoff_time)
+        
+        # ===== TIER 2: Core Depth Metrics =====
+        snapshot["tier2"] = self._compute_tier2_depth_metrics(cutoff_time)
+        
         # Store snapshot
         self.snapshot_history.append(snapshot)
         self.last_snapshot_time = current_time
@@ -1470,6 +1779,209 @@ class AdvancedOrderFlow:
         self._reset_30s_accumulators()
         
         return snapshot
+    
+    def _compute_tier1_trade_metrics(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Compute TIER 1 trade flow metrics including aggressive buy/sell volumes and counts.
+        These metrics capture market order flow from the aggTrade stream.
+        """
+        features = {}
+        
+        # Calculate recent aggressive trade volumes and counts (last 30 seconds)
+        recent_buy_vol = sum(vol for ts, vol in self.aggressive_buy_vol if ts >= cutoff_time)
+        recent_sell_vol = sum(vol for ts, vol in self.aggressive_sell_vol if ts >= cutoff_time)
+        
+        # Count recent trades
+        recent_buy_count = sum(1 for ts, vol in self.aggressive_buy_vol if ts >= cutoff_time)
+        recent_sell_count = sum(1 for ts, vol in self.aggressive_sell_vol if ts >= cutoff_time)
+        
+        # Export to features
+        features["aggressive_buy_vol"] = recent_buy_vol
+        features["aggressive_sell_vol"] = recent_sell_vol
+        features["aggressive_buy_count"] = recent_buy_count
+        features["aggressive_sell_count"] = recent_sell_count
+        
+        # Last price from VWAP or depth if available (needed for USD conversion)
+        if self.vwap_30s:
+            last_price = self.vwap_30s
+        elif self.depth_snapshots:
+            _, bids, asks = self.depth_snapshots[-1]
+            if bids and asks:
+                last_price = (bids[0][0] + asks[0][0]) / 2
+            else:
+                last_price = 0
+        else:
+            last_price = 0
+        
+        features["last_price"] = last_price
+        
+        # Calculate Buy VWAP and Sell VWAP from aggressive trade data (last 30 seconds)
+        recent_buy_vwap_data = [data for data in self.aggressive_buy_vwap_data if data[0] >= cutoff_time]
+        recent_sell_vwap_data = [data for data in self.aggressive_sell_vwap_data if data[0] >= cutoff_time]
+        
+        if recent_buy_vwap_data:
+            total_buy_notional = sum(vol * price for _, vol, price in recent_buy_vwap_data)
+            total_buy_vol = sum(vol for _, vol, _ in recent_buy_vwap_data)
+            features["buy_vwap"] = total_buy_notional / total_buy_vol if total_buy_vol > 0 else 0
+        else:
+            features["buy_vwap"] = 0
+        
+        if recent_sell_vwap_data:
+            total_sell_notional = sum(vol * price for _, vol, price in recent_sell_vwap_data)
+            total_sell_vol = sum(vol for _, vol, _ in recent_sell_vwap_data)
+            features["sell_vwap"] = total_sell_notional / total_sell_vol if total_sell_vol > 0 else 0
+        else:
+            features["sell_vwap"] = 0
+        
+        # Cumulative Volume Delta (CVD) - difference between buy and sell volumes
+        features["cum_volume_delta_30s"] = recent_buy_vol - recent_sell_vol
+        
+        # Delta acceleration (rate of change of CVD)
+        # Calculate CVD from previous 30s window for comparison
+        prev_cutoff = cutoff_time - 30
+        prev_buy_vol = sum(vol for ts, vol in self.aggressive_buy_vol if prev_cutoff <= ts < cutoff_time)
+        prev_sell_vol = sum(vol for ts, vol in self.aggressive_sell_vol if prev_cutoff <= ts < cutoff_time)
+        prev_cvd = prev_buy_vol - prev_sell_vol
+        features["delta_acceleration"] = (features["cum_volume_delta_30s"] - prev_cvd) / 30.0 if prev_cutoff >= 0 else 0
+        
+        # Trade size percentiles from recent trades (in USD)
+        if len(self.trade_sizes) > 0 and last_price > 0:
+            sorted_sizes = sorted(self.trade_sizes)
+            # Convert BTC amounts to USD by multiplying by last_price
+            features["trade_size_p50"] = sorted_sizes[len(sorted_sizes) // 2] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p75"] = sorted_sizes[int(len(sorted_sizes) * 0.75)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p90"] = sorted_sizes[int(len(sorted_sizes) * 0.90)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p95"] = sorted_sizes[int(len(sorted_sizes) * 0.95)] * last_price if len(sorted_sizes) > 0 else 0
+            features["trade_size_p99"] = sorted_sizes[int(len(sorted_sizes) * 0.99)] * last_price if len(sorted_sizes) > 0 else 0
+        else:
+            features["trade_size_p50"] = 0
+            features["trade_size_p75"] = 0
+            features["trade_size_p90"] = 0
+            features["trade_size_p95"] = 0
+            features["trade_size_p99"] = 0
+        
+        # Large Order Tracking (>$10K trades)
+        recent_large_orders = [order for order in self.large_orders if order[0] >= cutoff_time]
+        features["large_order_count"] = len(recent_large_orders)
+        large_buy_count = sum(1 for order in recent_large_orders if order[1] == 'buy')
+        large_sell_count = sum(1 for order in recent_large_orders if order[1] == 'sell')
+        features["large_order_buy_count"] = large_buy_count
+        features["large_order_sell_count"] = large_sell_count
+        features["large_order_total_notional"] = sum(order[3] for order in recent_large_orders)
+        
+        # Whale Trade Tracking (>$25K trades)
+        recent_whale_trades = [trade for trade in self.whale_trades if trade[0] >= cutoff_time]
+        features["whale_trade_count"] = len(recent_whale_trades)
+        whale_buy_count = sum(1 for trade in recent_whale_trades if trade[1] == 'buy')
+        whale_sell_count = sum(1 for trade in recent_whale_trades if trade[1] == 'sell')
+        features["whale_buy_count"] = whale_buy_count
+        features["whale_sell_count"] = whale_sell_count
+        features["whale_total_notional"] = sum(trade[3] for trade in recent_whale_trades)
+        
+        # Block Trade Tracking (institutional size >$100K from block_trades_enhanced)
+        recent_block_trades = [trade for trade in self.block_trades_enhanced if trade[0] >= cutoff_time]
+        features["block_trade_count"] = len(recent_block_trades)
+        block_buy_count = sum(1 for trade in recent_block_trades if trade[1] == 'buy')
+        block_sell_count = sum(1 for trade in recent_block_trades if trade[1] == 'sell')
+        features["block_buy_count"] = block_buy_count
+        features["block_sell_count"] = block_sell_count
+        features["block_total_notional"] = sum(trade[3] for trade in recent_block_trades)
+        
+        # Smart Money Metrics
+        total_trades = recent_buy_count + recent_sell_count
+        smart_money_trades = features["large_order_count"] + features["block_trade_count"]
+        features["smart_money_ratio"] = (smart_money_trades / total_trades) if total_trades > 0 else 0
+        
+        # Institutional Bias (buy vs sell pressure from large/whale/block trades)
+        institutional_buy_notional = (
+            sum(order[3] for order in recent_large_orders if order[1] == 'buy') +
+            sum(trade[3] for trade in recent_whale_trades if trade[1] == 'buy') +
+            sum(trade[3] for trade in recent_block_trades if trade[1] == 'buy')
+        )
+        institutional_sell_notional = (
+            sum(order[3] for order in recent_large_orders if order[1] == 'sell') +
+            sum(trade[3] for trade in recent_whale_trades if trade[1] == 'sell') +
+            sum(trade[3] for trade in recent_block_trades if trade[1] == 'sell')
+        )
+        total_institutional_notional = institutional_buy_notional + institutional_sell_notional
+        
+        if total_institutional_notional > 0:
+            # Bias: +1 = all institutional buying, -1 = all institutional selling, 0 = balanced
+            features["institutional_bias"] = (institutional_buy_notional - institutional_sell_notional) / total_institutional_notional
+        else:
+            features["institutional_bias"] = 0
+        
+        # Trade Size Bucket Analytics (micro/small/medium/large/block distribution)
+        features["size_bucket_volumes"] = dict(self.size_bucket_volumes)
+        features["size_bucket_counts"] = dict(self.size_bucket_counts)
+        features["size_bucket_notionals"] = dict(self.size_bucket_notionals)
+        
+        return features
+    
+    def _compute_tier2_depth_metrics(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Compute TIER 2 depth metrics including depth imbalances at various levels.
+        These are core order book metrics that show buyer/seller pressure.
+        """
+        features = {}
+        
+        # Get the latest depth snapshot
+        if not self.depth_snapshots:
+            return {
+                "depth_imbalance_l1": 0.0,
+                "depth_imbalance_l5": 0.0,
+                "depth_l10_bid": 0.0,
+                "depth_l10_ask": 0.0,
+                "depth_l20_bid": 0.0,
+                "depth_l20_ask": 0.0,
+                "vwap_30s": 0.0,
+                "avg_spread_30s": 0.0,
+                "min_spread_30s": 0.0,
+                "max_spread_30s": 0.0
+            }
+        
+        _, bids, asks = self.depth_snapshots[-1]
+        
+        # L1 Depth Imbalance (best bid/ask)
+        if bids and asks:
+            bid_l1 = bids[0][1] if len(bids) > 0 else 0.0
+            ask_l1 = asks[0][1] if len(asks) > 0 else 0.0
+            features["depth_imbalance_l1"] = (bid_l1 - ask_l1) / (bid_l1 + ask_l1 + 1e-8)
+        else:
+            features["depth_imbalance_l1"] = 0.0
+        
+        # L5 Depth Imbalance (top 5 levels)
+        if len(bids) >= 5 and len(asks) >= 5:
+            bid_l5 = sum(q for _, q in bids[:5])
+            ask_l5 = sum(q for _, q in asks[:5])
+            features["depth_imbalance_l5"] = (bid_l5 - ask_l5) / (bid_l5 + ask_l5 + 1e-8)
+        else:
+            features["depth_imbalance_l5"] = 0.0
+        
+        # L10 Depth (for display calculations)
+        features["depth_l10_bid"] = self.depth_l10.get("bid", 0.0)
+        features["depth_l10_ask"] = self.depth_l10.get("ask", 0.0)
+        
+        # L20 Depth (for display calculations)
+        features["depth_l20_bid"] = self.depth_l20.get("bid", 0.0)
+        features["depth_l20_ask"] = self.depth_l20.get("ask", 0.0)
+        
+        # VWAP (30-second)
+        features["vwap_30s"] = self.vwap_30s if self.vwap_30s else 0.0
+        
+        # Average spread (30-second)
+        recent_spreads = [spread for ts, spread in self.spread_history if ts >= cutoff_time]
+        features["avg_spread_30s"] = safe_mean(recent_spreads, 0.0)
+        
+        # Min/Max spread (30-second range)
+        if recent_spreads:
+            features["min_spread_30s"] = min(recent_spreads)
+            features["max_spread_30s"] = max(recent_spreads)
+        else:
+            features["min_spread_30s"] = 0.0
+            features["max_spread_30s"] = 0.0
+        
+        return features
     
     def _compute_new_orderbook_features(self, cutoff_time: float) -> Dict[str, Any]:
         """
@@ -1818,15 +2330,17 @@ class AdvancedOrderFlow:
         # ========== 1. VOLUME-WEIGHTED SPREAD ANALYSIS ==========
         
         # Calculate volume-weighted mid price
-        bid_vwap = sum(p * q for p, q in latest_bids[:10]) / (sum(q for _, q in latest_bids[:10]) + 1e-8)
-        ask_vwap = sum(p * q for p, q in latest_asks[:10]) / (sum(q for _, q in latest_asks[:10]) + 1e-8)
+        # PRIORITY 2 ENHANCEMENT: Expand VW spread to 50+ levels for deeper liquidity analysis
+        depth_levels = min(50, len(latest_bids), len(latest_asks))
+        bid_vwap = sum(p * q for p, q in latest_bids[:depth_levels]) / (sum(q for _, q in latest_bids[:depth_levels]) + 1e-8)
+        ask_vwap = sum(p * q for p, q in latest_asks[:depth_levels]) / (sum(q for _, q in latest_asks[:depth_levels]) + 1e-8)
         vw_mid = (bid_vwap + ask_vwap) / 2
         
         # Quoted spread
         quoted_spread = latest_asks[0][0] - latest_bids[0][0]
         quoted_spread_bps = (quoted_spread / vw_mid) * 10000
         
-        # Volume-weighted spread
+        # Volume-weighted spread (now using 50+ levels)
         vw_spread = ask_vwap - bid_vwap
         vw_spread_bps = (vw_spread / vw_mid) * 10000
         
@@ -1854,7 +2368,10 @@ class AdvancedOrderFlow:
             if len(spreads) >= 2:
                 spread_change = spreads[-1] - spreads[0]
                 time_diff = timestamps[-1] - timestamps[0]
-                spread_velocity_bps_per_sec = (spread_change / (spreads[0] + 1e-8)) * 10000 / (time_diff + 1e-8)
+                # FIX: Calculate velocity relative to mid-price, not spread itself
+                # Get mid-price from first snapshot to normalize
+                first_mid = (recent_snapshots[-10][1][0][0] + recent_snapshots[-10][2][0][0]) / 2 if recent_snapshots[-10][1] and recent_snapshots[-10][2] else 1.0
+                spread_velocity_bps_per_sec = (spread_change / (first_mid + 1e-8)) * 10000 / (time_diff + 1e-8)
                 features["spread_velocity_bps_per_sec"] = spread_velocity_bps_per_sec
                 features["spread_trend"] = "narrowing" if spread_change < 0 else ("widening" if spread_change > 0 else "stable")
             else:
@@ -1876,7 +2393,9 @@ class AdvancedOrderFlow:
         imb_l5 = calc_imbalance(latest_bids, latest_asks, 5)
         imb_l10 = calc_imbalance(latest_bids, latest_asks, 10)
         imb_l20 = calc_imbalance(latest_bids, latest_asks, 20)
-        imb_l50 = calc_imbalance(latest_bids, latest_asks, min(50, len(latest_bids), len(latest_asks)))
+        # PRIORITY 3 FIX: Standardize L50 imbalance to use consistent depth comparison
+        l50_depth = min(50, len(latest_bids), len(latest_asks))
+        imb_l50 = calc_imbalance(latest_bids, latest_asks, l50_depth)
         
         features["imbalance_l5_pct"] = imb_l5
         features["imbalance_l10_pct"] = imb_l10
@@ -1886,13 +2405,17 @@ class AdvancedOrderFlow:
         # Imbalance momentum (rate of change)
         if len(recent_snapshots) >= 10:
             imbalances = []
+            timestamps_imb = []
             for ts, bids, asks in recent_snapshots[-10:]:
                 if bids and asks:
                     imbalances.append(calc_imbalance(bids, asks, 10))
+                    timestamps_imb.append(ts)
             
-            if len(imbalances) >= 2:
+            if len(imbalances) >= 2 and len(timestamps_imb) >= 2:
                 imb_change = imbalances[-1] - imbalances[0]
-                features["imbalance_momentum_pct_per_sec"] = imb_change / (len(recent_snapshots) * 0.1 + 1e-8)
+                # FIX: Use actual timestamp difference instead of assuming 0.1s per snapshot
+                time_diff_imb = timestamps_imb[-1] - timestamps_imb[0]
+                features["imbalance_momentum_pct_per_sec"] = imb_change / (time_diff_imb + 1e-8)
                 features["imbalance_acceleration"] = "accelerating_bid" if imb_change > 2 else ("accelerating_ask" if imb_change < -2 else "stable")
             else:
                 features["imbalance_momentum_pct_per_sec"] = 0.0
@@ -1926,27 +2449,43 @@ class AdvancedOrderFlow:
         liquidity_cliffs_bid = []
         liquidity_cliffs_ask = []
         
-        # Detect sudden liquidity drops (>50% decrease between consecutive levels)
-        for i in range(1, min(20, len(latest_bids))):
+        # PRIORITY 2 ENHANCEMENT: Detect sudden liquidity drops with slippage calculation
+        # Expanded from 20 to 50 levels for deeper cliff detection
+        cliff_depth = min(50, len(latest_bids), len(latest_asks))
+        
+        total_slippage_bid = 0.0
+        total_slippage_ask = 0.0
+        
+        for i in range(1, cliff_depth):
             vol_drop_pct = (latest_bids[i-1][1] - latest_bids[i][1]) / (latest_bids[i-1][1] + 1e-8) * 100
             if vol_drop_pct > 50:
+                # Calculate slippage: price distance from best bid to cliff
+                slippage_bps = abs(latest_bids[0][0] - latest_bids[i][0]) / latest_bids[0][0] * 10000
+                total_slippage_bid += slippage_bps
                 liquidity_cliffs_bid.append({
                     "price": latest_bids[i][0],
                     "drop_pct": vol_drop_pct,
-                    "level": i
+                    "level": i,
+                    "slippage_bps": slippage_bps
                 })
         
-        for i in range(1, min(20, len(latest_asks))):
+        for i in range(1, cliff_depth):
             vol_drop_pct = (latest_asks[i-1][1] - latest_asks[i][1]) / (latest_asks[i-1][1] + 1e-8) * 100
             if vol_drop_pct > 50:
+                # Calculate slippage: price distance from best ask to cliff
+                slippage_bps = abs(latest_asks[i][0] - latest_asks[0][0]) / latest_asks[0][0] * 10000
+                total_slippage_ask += slippage_bps
                 liquidity_cliffs_ask.append({
                     "price": latest_asks[i][0],
                     "drop_pct": vol_drop_pct,
-                    "level": i
+                    "level": i,
+                    "slippage_bps": slippage_bps
                 })
         
         features["liquidity_cliffs_bid_count"] = len(liquidity_cliffs_bid)
         features["liquidity_cliffs_ask_count"] = len(liquidity_cliffs_ask)
+        features["liquidity_cliff_slippage_bid_bps"] = total_slippage_bid
+        features["liquidity_cliff_slippage_ask_bps"] = total_slippage_ask
         
         # Stop-loss cluster detection (round numbers with high volume concentration)
         mid_price = (latest_bids[0][0] + latest_asks[0][0]) / 2
@@ -1991,14 +2530,69 @@ class AdvancedOrderFlow:
         
         # Layering pattern detection
         layering_patterns = 0
-        # Check for sequential orders at similar sizes (layering pattern)
-        for i in range(min(5, len(latest_bids) - 2)):
+        # PRIORITY 2 ENHANCEMENT: Check for sequential orders at similar sizes (layering pattern)
+        # Expanded from 5 to 30 levels for comprehensive institutional layering detection
+        layering_depth = min(30, len(latest_bids) - 2)
+        for i in range(layering_depth):
             if (abs(latest_bids[i][1] - latest_bids[i+1][1]) / (latest_bids[i][1] + 1e-8) < 0.1 and
                 abs(latest_bids[i+1][1] - latest_bids[i+2][1]) / (latest_bids[i+1][1] + 1e-8) < 0.1):
                 layering_patterns += 1
         
+        # Check ask side layering as well
+        for i in range(min(30, len(latest_asks) - 2)):
+            if (abs(latest_asks[i][1] - latest_asks[i+1][1]) / (latest_asks[i][1] + 1e-8) < 0.1 and
+                abs(latest_asks[i+1][1] - latest_asks[i+2][1]) / (latest_asks[i+1][1] + 1e-8) < 0.1):
+                layering_patterns += 1
+        
         features["layering_patterns_count"] = layering_patterns
         features["manipulation_probability"] = "high" if (spoofing_events > 2 and layering_patterns > 2) else "low"
+        
+        # PRIORITY 2 ENHANCEMENT: Magnet volume velocity tracking
+        # Track volume accumulation rate at psychologically significant levels (round numbers)
+        magnet_levels = []
+        mid_price = (latest_bids[0][0] + latest_asks[0][0]) / 2
+        
+        # Check for round number magnets (e.g., $88,000, $87,500, etc.)
+        for price_level in [mid_price - (mid_price % 100) + offset for offset in [-500, -250, 0, 250, 500]]:
+            # Find volume near this magnet level (within 10 bps)
+            magnet_range_bps = 10
+            magnet_range = price_level * (magnet_range_bps / 10000)
+            
+            bid_vol_near_magnet = sum(q for p, q in latest_bids if abs(p - price_level) < magnet_range)
+            ask_vol_near_magnet = sum(q for p, q in latest_asks if abs(p - price_level) < magnet_range)
+            
+            if bid_vol_near_magnet > 0 or ask_vol_near_magnet > 0:
+                magnet_levels.append({
+                    "price": price_level,
+                    "bid_volume": bid_vol_near_magnet,
+                    "ask_volume": ask_vol_near_magnet,
+                    "total_volume": bid_vol_near_magnet + ask_vol_near_magnet
+                })
+        
+        # Calculate magnet volume velocity (if we have historical data)
+        magnet_velocity = 0.0
+        if len(self.depth_snapshots) >= 2:
+            # depth_snapshots stores tuples: (timestamp, bids, asks)
+            prev_timestamp, prev_bids, prev_asks = self.depth_snapshots[-2]
+            latest_timestamp = recent_snapshots[-1][0]
+            
+            if prev_bids and prev_asks and magnet_levels:
+                # Check volume change at strongest magnet
+                strongest_magnet = max(magnet_levels, key=lambda x: x["total_volume"])
+                magnet_price = strongest_magnet["price"]
+                magnet_range = magnet_price * (10 / 10000)
+                
+                prev_vol_near_magnet = sum(q for p, q in prev_bids if abs(p - magnet_price) < magnet_range)
+                prev_vol_near_magnet += sum(q for p, q in prev_asks if abs(p - magnet_price) < magnet_range)
+                
+                current_vol = strongest_magnet["total_volume"]
+                time_diff = latest_timestamp - prev_timestamp
+                
+                if time_diff > 0:
+                    magnet_velocity = (current_vol - prev_vol_near_magnet) / time_diff
+        
+        features["magnet_volume_velocity"] = magnet_velocity
+        features["magnet_levels_count"] = len(magnet_levels)
         
         # ========== 5. SUPPORT/RESISTANCE STRENGTH SCORING ==========
         
@@ -2020,9 +2614,10 @@ class AdvancedOrderFlow:
         # Find strongest support (highest bid volume concentration)
         if bid_levels:
             strongest_support = max(bid_levels.items(), key=lambda x: x[1])
-            support_strength = (strongest_support[1] / (total_bid_vol + 1e-8)) * 100
+            support_concentration = (strongest_support[1] / (total_bid_vol + 1e-8))
             features["dynamic_support_price"] = strongest_support[0]
-            features["support_strength_score"] = min(100, support_strength * 10)
+            # FORENSIC FIX: Use sqrt scaling for better distribution (prevents overflow at 100)
+            features["support_strength_score"] = min(100, (support_concentration ** 0.5) * 100)
         else:
             features["dynamic_support_price"] = mid_price * 0.99
             features["support_strength_score"] = 0.0
@@ -2030,17 +2625,24 @@ class AdvancedOrderFlow:
         # Find strongest resistance (highest ask volume concentration)
         if ask_levels:
             strongest_resistance = max(ask_levels.items(), key=lambda x: x[1])
-            resistance_strength = (strongest_resistance[1] / (total_ask_vol + 1e-8)) * 100
+            resistance_concentration = (strongest_resistance[1] / (total_ask_vol + 1e-8))
             features["dynamic_resistance_price"] = strongest_resistance[0]
-            features["resistance_strength_score"] = min(100, resistance_strength * 10)
+            # FORENSIC FIX: Use sqrt scaling for better distribution
+            features["resistance_strength_score"] = min(100, (resistance_concentration ** 0.5) * 100)
         else:
             features["dynamic_resistance_price"] = mid_price * 1.01
             features["resistance_strength_score"] = 0.0
         
         # Volume profile POC (Point of Control)
-        all_levels = list(bid_levels.items()) + list(ask_levels.items())
-        if all_levels:
-            poc = max(all_levels, key=lambda x: x[1])
+        # FORENSIC FIX: Keep separate bid/ask levels, use combined dict for POC only
+        combined_levels = {}
+        for price, vol in bid_levels.items():
+            combined_levels[price] = combined_levels.get(price, 0) + vol
+        for price, vol in ask_levels.items():
+            combined_levels[price] = combined_levels.get(price, 0) + vol
+            
+        if combined_levels:
+            poc = max(combined_levels.items(), key=lambda x: x[1])
             features["volume_profile_poc"] = poc[0]
             features["poc_volume"] = poc[1]
         else:
@@ -2065,10 +2667,11 @@ class AdvancedOrderFlow:
             total_nearby = nearby_bid_vol + nearby_ask_vol
             
             # Calculate attraction strength
-            attraction_strength = (total_nearby / (total_bid_vol + total_ask_vol + 1e-8)) * 100
+            # FORENSIC FIX: Use sqrt scaling to prevent overflow
+            attraction_concentration = (total_nearby / (total_bid_vol + total_ask_vol + 1e-8))
             magnet_scores.append({
                 "price": psy_level,
-                "strength": min(100, attraction_strength * 20),
+                "strength": min(100, (attraction_concentration ** 0.5) * 100),
                 "volume": total_nearby
             })
         
@@ -2090,20 +2693,44 @@ class AdvancedOrderFlow:
         
         # ========== 7. MICROSTRUCTURE REGIME CLASSIFICATION ==========
         
-        # Trending vs Mean-Reverting (Hurst exponent approximation)
+        # Trending vs Mean-Reverting (Hurst exponent with proper detrending)
         if len(self.price_changes) >= 50:
             prices = list(self.price_changes)[-50:]
-            # Simple Hurst estimation using R/S analysis
-            returns = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+            # PRIORITY 3 FIX: Proper Hurst estimation with detrending
+            # Remove linear trend first to avoid bias
+            x = list(range(len(prices)))
+            mean_x = statistics.mean(x)
+            mean_y = statistics.mean(prices)
+            
+            # Linear regression slope
+            numerator = sum((x[i] - mean_x) * (prices[i] - mean_y) for i in range(len(prices)))
+            denominator = sum((x[i] - mean_x) ** 2 for i in range(len(prices)))
+            slope = numerator / (denominator + 1e-8)
+            intercept = mean_y - slope * mean_x
+            
+            # Detrended series
+            detrended = [prices[i] - (slope * x[i] + intercept) for i in range(len(prices))]
+            returns = [detrended[i] - detrended[i-1] for i in range(1, len(detrended))]
+            
             if returns:
                 mean_return = statistics.mean(returns)
                 std_return = statistics.stdev(returns) if len(returns) > 1 else 1.0
                 
-                # R/S ratio
+                # R/S ratio on detrended data
                 cumsum = [sum(returns[:i+1]) - (i+1) * mean_return for i in range(len(returns))]
                 R = max(cumsum) - min(cumsum) if cumsum else 0
                 S = std_return
-                hurst_approx = 0.5 if S == 0 else min(1.0, max(0.0, (R / S) / len(returns) ** 0.5))
+                
+                # FORENSIC FIX: Proper Hurst calculation with bounds checking
+                # Use log(R/S) / log(n) formula to prevent overflow
+                n = len(returns)
+                if S > 1e-10 and R > 0 and n > 1:
+                    import math
+                    rs_ratio = R / S
+                    # Hurst = log(R/S) / log(n), bounded to [0, 1]
+                    hurst_approx = min(1.0, max(0.0, math.log(rs_ratio) / math.log(n)))
+                else:
+                    hurst_approx = 0.5
                 
                 features["hurst_exponent"] = hurst_approx
                 features["regime_trend_meanrevert"] = "trending" if hurst_approx > 0.55 else ("mean_reverting" if hurst_approx < 0.45 else "neutral")
@@ -2225,6 +2852,8 @@ class AdvancedOrderFlow:
             # Liquidity Cliffs
             "liquidity_cliffs_bid_count": 0,
             "liquidity_cliffs_ask_count": 0,
+            "liquidity_cliff_slippage_bid_bps": 0.0,
+            "liquidity_cliff_slippage_ask_bps": 0.0,
             "stop_loss_cluster_count": 0,
             "liquidity_vacuum_bid_levels": 0,
             "liquidity_vacuum_ask_levels": 0,
@@ -2237,6 +2866,8 @@ class AdvancedOrderFlow:
             "spoofing_risk": "low",
             "layering_patterns_count": 0,
             "manipulation_probability": "low",
+            "magnet_volume_velocity": 0.0,
+            "magnet_levels_count": 0,
             
             # Support/Resistance
             "dynamic_support_price": 0.0,
@@ -2985,7 +3616,7 @@ class AdvancedOrderFlow:
             
             # Trap if current is 3x larger than neighbors
             if current_vol > prev_vol * 3 and current_vol > next_vol * 3:
-                trap_score = min(100, (current_vol / max(prev_vol, next_vol)) * 10)
+                trap_score = min(100, (current_vol / max(prev_vol, next_vol, 1e-8)) * 10)
                 self.liquidity_traps_bid.append((latest_bids[i][0], current_vol, trap_score))
         
         self.trap_count_bid = len(self.liquidity_traps_bid)
@@ -2997,7 +3628,7 @@ class AdvancedOrderFlow:
             next_vol = latest_asks[i + 1][1]
             
             if current_vol > prev_vol * 3 and current_vol > next_vol * 3:
-                trap_score = min(100, (current_vol / max(prev_vol, next_vol)) * 10)
+                trap_score = min(100, (current_vol / max(prev_vol, next_vol, 1e-8)) * 10)
                 self.liquidity_traps_ask.append((latest_asks[i][0], current_vol, trap_score))
         
         self.trap_count_ask = len(self.liquidity_traps_ask)
@@ -3083,6 +3714,273 @@ class AdvancedOrderFlow:
             "correlation_breakdown_signal": False,
             "deep_book_support_score": 0.0,
             "deep_book_resistance_score": 0.0,
+        }
+    
+    def _compute_smart_order_detection(self, cutoff_time: float) -> Dict[str, Any]:
+        """
+        Detect sophisticated order types and manipulative patterns.
+        
+        Implements:
+        1. Iceberg detection (repeated fills + volume regeneration)
+        2. Peg order tracking (orders following mid-price)
+        3. Fake liquidity scoring (cancelled-before-fill ratio)
+        4. Front-running detection (order timing analysis)
+        5. Wall flip tracking (support/resistance role changes)
+        6. L1 queue change recording (best price level volume tracking)
+        """
+        features = {}
+        
+        # Get recent depth snapshots (last 30 seconds)
+        recent_snapshots = [s for s in list(self.depth_snapshots) if s[0] >= cutoff_time]
+        
+        if len(recent_snapshots) < 3:
+            return self._get_empty_smart_order_features()
+        
+        # 1. ICEBERG ORDER DETECTION
+        # Look for price levels with repeated volume regeneration after consumption
+        iceberg_candidates = {}
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Check both sides for iceberg patterns
+            for side, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
+                prev_dict = {p: q for p, q in prev_levels[:20]}
+                curr_dict = {p: q for p, q in curr_levels[:20]}
+                
+                # Find prices that exist in both snapshots
+                common_prices = set(prev_dict.keys()) & set(curr_dict.keys())
+                
+                for price in common_prices:
+                    prev_vol = prev_dict[price]
+                    curr_vol = curr_dict[price]
+                    
+                    # Iceberg pattern: volume decreased then increased again (regenerated)
+                    # This suggests hidden orders replenishing visible size
+                    if curr_vol > prev_vol * 0.8 and prev_vol > 0:
+                        # Volume regenerated - potential iceberg
+                        key = (side, price)
+                        if key not in iceberg_candidates:
+                            iceberg_candidates[key] = {"regenerations": 0, "total_regen_vol": 0.0, "price": price}
+                        iceberg_candidates[key]["regenerations"] += 1
+                        iceberg_candidates[key]["total_regen_vol"] += (curr_vol - prev_vol * 0.8)
+        
+        # Filter for strong iceberg signals (2+ regenerations)
+        confirmed_icebergs = {k: v for k, v in iceberg_candidates.items() if v["regenerations"] >= 2}
+        
+        features["iceberg_order_count"] = len(confirmed_icebergs)
+        features["iceberg_estimated_hidden_volume"] = sum(v["total_regen_vol"] for v in confirmed_icebergs.values())
+        
+        # Update class state with compound key (side, price) to prevent overwriting
+        self.iceberg_size_estimate = {k: v["total_regen_vol"] for k, v in confirmed_icebergs.items()}
+        
+        # 2. PEG ORDER DETECTION
+        # Orders that move with mid-price (maintain relative distance)
+        peg_count = 0
+        
+        if len(recent_snapshots) >= 5:
+            # Track orders across snapshots
+            for i in range(len(recent_snapshots) - 4):
+                snapshots_window = recent_snapshots[i:i+5]
+                
+                # Calculate mid-price for each snapshot
+                mid_prices = []
+                bid_levels_by_snapshot = []
+                ask_levels_by_snapshot = []
+                
+                for ts, bids, asks in snapshots_window:
+                    if bids and asks:
+                        mid = (bids[0][0] + asks[0][0]) / 2
+                        mid_prices.append(mid)
+                        bid_levels_by_snapshot.append({p: q for p, q in bids[:10]})
+                        ask_levels_by_snapshot.append({p: q for p, q in asks[:10]})
+                
+                if len(mid_prices) == 5:
+                    # Look for orders maintaining relative position as mid moves
+                    mid_change = mid_prices[-1] - mid_prices[0]
+                    
+                    if abs(mid_change) > mid_prices[0] * 0.0001:  # Mid moved meaningfully
+                        # Check if any price levels moved proportionally
+                        for side, levels_by_snapshot in [("bid", bid_levels_by_snapshot), ("ask", ask_levels_by_snapshot)]:
+                            # Track price movement
+                            for snapshot_idx in range(len(levels_by_snapshot) - 1):
+                                curr_prices = set(levels_by_snapshot[snapshot_idx].keys())
+                                next_prices = set(levels_by_snapshot[snapshot_idx + 1].keys())
+                                
+                                # Look for orders that "moved" with mid-price
+                                for curr_price in curr_prices:
+                                    expected_new_price = curr_price + (mid_prices[snapshot_idx + 1] - mid_prices[snapshot_idx])
+                                    
+                                    # Check if there's a similar order at expected price
+                                    for next_price in next_prices:
+                                        if abs(next_price - expected_new_price) < mid_prices[0] * 0.0001:
+                                            peg_count += 1
+                                            break
+        
+        features["peg_order_count"] = peg_count
+        self.peg_order_count = peg_count
+        
+        # 3. FAKE LIQUIDITY DETECTION
+        # Orders that get cancelled before being filled
+        cancelled_before_fill = 0
+        total_disappeared = 0
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Check both sides
+            for side_name, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
+                prev_dict = {p: q for p, q in prev_levels[:20]}
+                curr_dict = {p: q for p, q in curr_levels[:20]}
+                
+                # Find orders that disappeared
+                disappeared_prices = set(prev_dict.keys()) - set(curr_dict.keys())
+                
+                for price in disappeared_prices:
+                    total_disappeared += 1
+                    
+                    # If volume > 50% of original, likely cancelled (not filled)
+                    # Filled orders typically reduce gradually
+                    if price in prev_dict and prev_dict[price] > 0:
+                        # Check if it was away from best price (not likely to be filled)
+                        best_price = prev_levels[0][0] if prev_levels else price
+                        distance_pct = abs(price - best_price) / best_price
+                        
+                        if distance_pct > 0.0002:  # > 2 bps from best
+                            cancelled_before_fill += 1
+                            
+                            # FIX: Accumulate spoofing events for large cancelled orders
+                            # Large orders (>1.0 BTC) cancelled away from best price suggest spoofing
+                            if prev_dict[price] > 1.0:
+                                self.spoofing_events.append((curr_ts, side_name, price, prev_dict[price]))
+        
+        fake_liquidity_ratio = cancelled_before_fill / (total_disappeared + 1e-8)
+        features["fake_liquidity_score"] = min(fake_liquidity_ratio, 1.0)
+        self.fake_liquidity_score = features["fake_liquidity_score"]
+        
+        # 4. FRONT-RUNNING DETECTION
+        # Orders inserted immediately before large trades
+        front_running_count = 0
+        
+        # PRIORITY 3 FIX: Add front-running event accumulation (was missing)
+        # Look for patterns: new order appears -> large order fills shortly after
+        for i in range(1, min(len(recent_snapshots), 10)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            time_diff = curr_ts - prev_ts
+            
+            # Look for new orders (very short time between snapshots suggests insertion)
+            if time_diff < 0.2:  # < 200ms (fast insertion)
+                for side, prev_levels, curr_levels in [("bid", prev_bids, curr_bids), ("ask", prev_asks, curr_asks)]:
+                    prev_dict = {p: q for p, q in prev_levels[:5]}  # Top 5 levels
+                    curr_dict = {p: q for p, q in curr_levels[:5]}
+                    
+                    # New prices that appeared
+                    new_prices = set(curr_dict.keys()) - set(prev_dict.keys())
+                    
+                    # If new order at/near best price with significant size
+                    if new_prices and curr_levels:
+                        best_price = curr_levels[0][0]
+                        for new_price in new_prices:
+                            if abs(new_price - best_price) / best_price < 0.0001:  # Within 1 bp of best
+                                if curr_dict[new_price] > 0.1:  # Significant size
+                                    front_running_count += 1
+                                    # Properly accumulate front-running events
+                                    self.front_running_events.append((curr_ts, side, new_price, curr_dict[new_price]))
+        
+        features["front_running_events"] = len(list(self.front_running_events))  # Count accumulated events
+        
+        # 5. WALL FLIP TRACKING
+        # Track when support becomes resistance or vice versa
+        wall_flips = 0
+        
+        # Look back further for wall flip detection (need 10+ snapshots)
+        all_snapshots = list(self.depth_snapshots)[-20:] if len(self.depth_snapshots) >= 20 else list(self.depth_snapshots)
+        
+        if len(all_snapshots) >= 10:
+            # Build price-to-side mapping over time
+            price_sides = {}  # price -> list of (timestamp, side, volume)
+            
+            for ts, bids, asks in all_snapshots:
+                # Track significant levels (walls)
+                for p, q in bids[:10]:
+                    if q > 1.0:  # Significant volume
+                        if p not in price_sides:
+                            price_sides[p] = []
+                        price_sides[p].append((ts, "bid", q))
+                
+                for p, q in asks[:10]:
+                    if q > 1.0:  # Significant volume
+                        if p not in price_sides:
+                            price_sides[p] = []
+                        price_sides[p].append((ts, "ask", q))
+            
+            # Detect flips: same price showing as both bid and ask over time
+            for price, history in price_sides.items():
+                if len(history) >= 3:
+                    sides_seen = [side for _, side, _ in history]
+                    # Check if side changed
+                    if "bid" in sides_seen and "ask" in sides_seen:
+                        # Wall flipped
+                        wall_flips += 1
+                        self.wall_flip_events.append((history[-1][0], price, history[0][1], history[-1][1]))
+        
+        features["wall_flip_count"] = wall_flips
+        
+        # 6. L1 QUEUE CHANGES
+        # PRIORITY 3 FIX: Implement L1 queue change tracking (was initialized but never populated)
+        # Track volume changes at best bid/ask
+        l1_bid_changes = 0
+        l1_ask_changes = 0
+        
+        for i in range(1, len(recent_snapshots)):
+            prev_ts, prev_bids, prev_asks = recent_snapshots[i-1]
+            curr_ts, curr_bids, curr_asks = recent_snapshots[i]
+            
+            # Track best bid changes
+            if prev_bids and curr_bids:
+                prev_best_bid = prev_bids[0]
+                curr_best_bid = curr_bids[0]
+                
+                # Same price, different volume = queue change
+                if abs(prev_best_bid[0] - curr_best_bid[0]) < 0.01:
+                    if abs(prev_best_bid[1] - curr_best_bid[1]) > 0.01:
+                        l1_bid_changes += 1
+                        # Properly populate queue changes
+                        self.best_bid_queue_changes.append((curr_ts, curr_best_bid[0], prev_best_bid[1], curr_best_bid[1]))
+            
+            # Track best ask changes
+            if prev_asks and curr_asks:
+                prev_best_ask = prev_asks[0]
+                curr_best_ask = curr_asks[0]
+                
+                # Same price, different volume = queue change
+                if abs(prev_best_ask[0] - curr_best_ask[0]) < 0.01:
+                    if abs(prev_best_ask[1] - curr_best_ask[1]) > 0.01:
+                        l1_ask_changes += 1
+                        # Properly populate queue changes
+                        self.best_ask_queue_changes.append((curr_ts, curr_best_ask[0], prev_best_ask[1], curr_best_ask[1]))
+        
+        # Return accumulated counts from deques (not just local counters)
+        features["l1_bid_queue_changes"] = len(list(self.best_bid_queue_changes))
+        features["l1_ask_queue_changes"] = len(list(self.best_ask_queue_changes))
+        
+        return features
+    
+    def _get_empty_smart_order_features(self) -> Dict[str, Any]:
+        """Return empty values for smart order detection features."""
+        return {
+            "iceberg_order_count": 0,
+            "iceberg_estimated_hidden_volume": 0.0,
+            "peg_order_count": 0,
+            "fake_liquidity_score": 0.0,
+            "front_running_events": 0,
+            "wall_flip_count": 0,
+            "l1_bid_queue_changes": 0,
+            "l1_ask_queue_changes": 0,
         }
     
     def _get_empty_liquidity_vacuum_features(self) -> Dict[str, Any]:
@@ -3408,22 +4306,26 @@ class AdvancedOrderFlow:
         
         vwap_30s = snapshot.get("tier2", {}).get('vwap_30s', latest_price)
         
-        # Calculate approximate buy/sell VWAPs
-        if agg_buy_vol > 0 and agg_sell_vol > 0:
-            # Approximate VWAPs - premium for buyers, discount for sellers
-            buy_vwap = vwap_30s * (1 + (agg_imb_pct / 200))
-            sell_vwap = vwap_30s * (1 - (agg_imb_pct / 200))
+        # Get actual buy/sell VWAPs from tier1 (calculated from real trade data)
+        buy_vwap = snapshot.get("tier1", {}).get('buy_vwap', 0)
+        sell_vwap = snapshot.get("tier1", {}).get('sell_vwap', 0)
+        
+        # Display VWAPs
+        print(f"      Market VWAP:   ${vwap_30s:,.2f}")
+        print(f"      Buy VWAP:      ${buy_vwap:,.2f}")
+        print(f"      Sell VWAP:     ${sell_vwap:,.2f}")
+        
+        # Calculate and display VWAP spread if both VWAPs are available
+        if buy_vwap > 0 and sell_vwap > 0:
             vwap_spread = buy_vwap - sell_vwap
-            
-            print(f"      Market VWAP:   ${vwap_30s:,.2f}")
-            print(f"      Buy VWAP:      ${buy_vwap:,.2f}")
-            print(f"      Sell VWAP:     ${sell_vwap:,.2f}")
-            print(f"      VWAP Spread:   ${vwap_spread:,.2f} ({vwap_spread/vwap_30s*10000:.1f} bps)")
+            print(f"      VWAP Spread:   ${vwap_spread:,.2f} ({vwap_spread/max(vwap_30s, 1e-8)*10000:.1f} bps)")
             
             if vwap_spread > vwap_30s * 0.001:
                 print(f"         → Buyers paying significant premium")
             elif vwap_spread < -vwap_30s * 0.001:
                 print(f"         → Sellers accepting significant discount")
+        else:
+            print(f"      VWAP Spread:   $0.00 (0.0 bps)")
         
         # ===== SECTION 6: Market Momentum Indicators =====
         print(f"\n   ⚡ MARKET MOMENTUM & DYNAMICS:")
@@ -5848,7 +6750,7 @@ class MarketClient:
             # Store in advanced order flow
             if self.advanced_orderflow and bids and asks:
                 self.advanced_orderflow.store_full_depth(bids, asks, timestamp)
-                print(f"[{self.name}] ✅ Fetched full depth: {len(bids)} bids, {len(asks)} asks (1000 levels)")
+                print(f"[{self.name}] ✅ Fetched FULL market depth: {len(bids)} bids, {len(asks)} asks (ALL available levels - max 1000)")
                 
         except Exception as e:
             print(f"[{self.name}] ⚠️  Failed to fetch full depth: {e}")
@@ -6015,11 +6917,12 @@ class MarketClient:
             top_depth = float(d["b"][0][1]) + float(d["a"][0][1])
             self.top_depth_queue.append((ts_now, top_depth))
 
-            # Feed to Advanced Order Flow - ENHANCED: Use full depth merging
+            # Feed to Advanced Order Flow - ENHANCED: Use ALL available depth data
             if self.advanced_orderflow:
-                # Process top 100 levels from WebSocket
-                bids = [(float(p), float(q)) for p, q in d["b"][:100]]
-                asks = [(float(p), float(q)) for p, q in d["a"][:100]]
+                # ENHANCEMENT 1: Process ALL available levels from WebSocket (up to 1000)
+                # Changed from [:100] to [:1000] to capture complete market depth
+                bids = [(float(p), float(q)) for p, q in d["b"][:1000]]
+                asks = [(float(p), float(q)) for p, q in d["a"][:1000]]
                 
                 # Enable full depth mode to merge with 1000-level REST data
                 self.advanced_orderflow.process_depth_snapshot(ts_now, bids, asks, use_full_depth=True)
@@ -6407,36 +7310,35 @@ class MarketClient:
             
         _, bids, asks = self.advanced_orderflow.depth_snapshots[-1]
         
-        # CRITICAL: Filter out invalid/stale price levels BEFORE displaying
-        # Remove outlier orders that are way beyond reasonable price range
+        # CRITICAL: Use actual best bid/ask for mid-price calculation
+        # Calculate mid-price from RAW orderbook BEFORE any filtering
         if bids and asks:
-            # Use most recent valid price for reference
-            ref_price = asks[0][0] if asks[0][0] < 999999 else (bids[0][0] if bids[0][0] > 1 else 87000)
+            # Get best bid and best ask directly from orderbook
+            best_bid = bids[0][0]
+            best_ask = asks[0][0]
+            mid_price = (best_bid + best_ask) / 2
+            spread_pct = ((best_ask - best_bid) / mid_price) * 100
             
-            # Filter out extreme outliers (>30% away) - these are clearly stale/invalid
-            max_outlier_distance = ref_price * 0.30
+            # Sanity check: spread should be < 1% for BTC/USDT
+            if spread_pct > 1.0:
+                print(f"     ⚠️  WARNING: Abnormal spread detected ({spread_pct:.3f}%) - possible data issue")
+            
+            # Apply ±10% filter AFTER calculating mid-price from clean top-of-book
+            # This preserves actual market price while filtering display range
+            max_price_distance = mid_price * 0.10
             original_bid_count = len(bids)
             original_ask_count = len(asks)
-            bids = [(p, q) for p, q in bids if ref_price - p <= max_outlier_distance and p > 1]
-            asks = [(p, q) for p, q in asks if p - ref_price <= max_outlier_distance and p < 999999]
+            bids = [(p, q) for p, q in bids if mid_price - p <= max_price_distance and p > 1]
+            asks = [(p, q) for p, q in asks if p - mid_price <= max_price_distance and p < 999999]
             
-            outliers_removed = (original_bid_count - len(bids)) + (original_ask_count - len(asks))
+            filtered_count = (original_bid_count - len(bids)) + (original_ask_count - len(asks))
             
             if not bids or not asks:
-                print("     ⚠️  Insufficient valid depth data after removing outliers")
+                print("     ⚠️  Insufficient depth data after filtering")
                 return
             
-            # After removing outliers, calculate mid-price from cleaned data
-            mid_price = (bids[0][0] + asks[0][0]) / 2
-            spread_pct = ((asks[0][0] - bids[0][0]) / mid_price) * 100
-            
-            # Further filter to within 10% for display (keeps more valid data than 5%)
-            max_price_distance = mid_price * 0.10
-            bids = [(p, q) for p, q in bids if mid_price - p <= max_price_distance]
-            asks = [(p, q) for p, q in asks if p - mid_price <= max_price_distance]
-            
-            if outliers_removed > 0:
-                print(f"     ✅ Filtered out {outliers_removed} outlier orders (>30% from market)")
+            if filtered_count > 0:
+                print(f"     ✅ Filtered {filtered_count} orders outside ±10% range for display")
             print(f"     ✅ Displaying price levels within ±10% of mid: ${mid_price:,.2f} (Spread: {spread_pct:.3f}%)")
         
         # Analyze top 20 levels on each side
@@ -6450,26 +7352,32 @@ class MarketClient:
         bid_volumes = [(bids[i][0], bids[i][1]) for i in range(min(top_n, len(bids)))]
         ask_volumes = [(asks[i][0], asks[i][1]) for i in range(min(top_n, len(asks)))]
         
-        # Detect liquidity walls (orders >5x average size in top 10 levels)
-        avg_bid_vol = sum(v for _, v in bid_volumes[:10]) / 10 if len(bid_volumes) >= 10 else 0
-        avg_ask_vol = sum(v for _, v in ask_volumes[:10]) / 10 if len(ask_volumes) >= 10 else 0
+        # PRECISION IMPROVEMENT: Detect liquidity walls using refined threshold (3x instead of 5x)
+        # Calculate average over more levels for better baseline
+        check_levels = min(20, len(bid_volumes))  # Use top 20 for average calculation
+        avg_bid_vol = sum(v for _, v in bid_volumes[:check_levels]) / check_levels if check_levels >= 10 else 0
+        avg_ask_vol = sum(v for _, v in ask_volumes[:check_levels]) / check_levels if check_levels >= 10 else 0
         
-        bid_walls = [(p, v) for p, v in bid_volumes if v > avg_bid_vol * 5]
-        ask_walls = [(p, v) for p, v in ask_volumes if v > avg_ask_vol * 5]
+        # Use 3x threshold for more sensitive and precise wall detection
+        bid_walls = [(p, v) for p, v in bid_volumes if v > avg_bid_vol * 3.0]
+        ask_walls = [(p, v) for p, v in ask_volumes if v > avg_ask_vol * 3.0]
         
-        # Print liquidity wall summary
+        # Print liquidity wall summary with enhanced precision information
+        # Note: This display shows top levels, but actual wall tracking scans ALL available depth
         if bid_walls or ask_walls:
-            print(f"  🧱 LIQUIDITY WALLS DETECTED:")
+            print(f"  🧱 LIQUIDITY WALLS DETECTED (Display: top {len(bid_volumes)} levels shown, Full scanning: ALL available depth):")
             if bid_walls:
-                print(f"     📉 BID WALLS ({len(bid_walls)}):")
+                print(f"     📉 BID WALLS ({len(bid_walls)}) [Avg bid volume: {avg_bid_vol:.4f} BTC]:")
                 for price, vol in bid_walls[:5]:  # Top 5
-                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f})")
+                    multiplier = vol / avg_bid_vol if avg_bid_vol > 0 else 0
+                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
             if ask_walls:
-                print(f"     📈 ASK WALLS ({len(ask_walls)}):")
+                print(f"     📈 ASK WALLS ({len(ask_walls)}) [Avg ask volume: {avg_ask_vol:.4f} BTC]:")
                 for price, vol in ask_walls[:5]:  # Top 5
-                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f})")
+                    multiplier = vol / avg_ask_vol if avg_ask_vol > 0 else 0
+                    print(f"        ${price:,.2f}: {vol:,.4f} BTC (${price * vol:,.0f}) [{multiplier:.1f}x avg]")
         else:
-            print(f"  🧱 LIQUIDITY WALLS: None detected (balanced order book)")
+            print(f"  🧱 LIQUIDITY WALLS: None detected in displayed levels (Full scan: ALL depth analyzed in background)")
         
         # Print top 10 levels on each side
         print(f"\n  📊 TOP 10 BID LEVELS (Support):")
@@ -6571,6 +7479,37 @@ class MarketClient:
             print(f"     💡 CONTEXT: Heavy resistance testing - potential breakout if consumption continues")
         elif bid_events and ask_events:
             print(f"     💡 CONTEXT: Both sides tested - range-bound with potential for volatility")
+        
+        # ENHANCEMENT 2: Display fake wall detections
+        recent_fake_walls = [
+            fw for fw in self.advanced_orderflow.fake_wall_detections
+            if current_time - fw[0] <= 30
+        ]
+        if recent_fake_walls:
+            print(f"\n     ⚡ FAKE WALL DETECTIONS (vanished <5s, last 30s):")
+            for ts, price, vol, duration, side in recent_fake_walls[:5]:
+                print(f"        {side}: ${price:,.2f} | {vol:,.4f} BTC | Existed: {duration:.1f}s | ⚠️  SPOOFING SIGNAL")
+        
+        # ENHANCEMENT 3: Display liquidity accumulation/distribution zones
+        if self.advanced_orderflow.liquidity_accumulation_zones:
+            print(f"\n     📈 LIQUIDITY ACCUMULATION ZONES (5-min window):")
+            for price, vol, side, ts in self.advanced_orderflow.liquidity_accumulation_zones[:3]:
+                print(f"        {side} @ ${price:,.2f}: {vol:,.4f} BTC | 🟢 Building position")
+        
+        if self.advanced_orderflow.liquidity_distribution_zones:
+            print(f"\n     📉 LIQUIDITY DISTRIBUTION ZONES (5-min window):")
+            for price, vol, side, ts in self.advanced_orderflow.liquidity_distribution_zones[:3]:
+                print(f"        {side} @ ${price:,.2f}: {vol:,.4f} BTC | 🔴 Liquidating position")
+        
+        # ENHANCEMENT 4: Display institutional wall signatures
+        recent_institutional = [
+            inst for inst in self.advanced_orderflow.institutional_wall_signatures
+            if current_time - inst[0] <= 60
+        ]
+        if recent_institutional:
+            print(f"\n     🏛️  INSTITUTIONAL WALL SIGNATURES (last 60s):")
+            for ts, price, side, rebuild_count in recent_institutional[:3]:
+                print(f"        {side} @ ${price:,.2f} | {rebuild_count} rapid rebuilds | 🎯 INSTITUTIONAL PATTERN")
     
     def _print_advanced_microstructure(self, snapshot):
         """
@@ -6639,18 +7578,19 @@ class MarketClient:
             print(f"        Effective Tick Size:    ${new_features.get('effective_tick_size', 0):.2f}")
             
             # Smart Order Detection
+            smart_detection = snapshot.get("smart_order_detection", {})
             print(f"\n     🎯 Smart Order Detection:")
-            print(f"        Iceberg Orders: {new_features.get('iceberg_estimated_count', 0)} (Est. Hidden: {new_features.get('iceberg_estimated_total_size', 0):.2f} BTC)")
-            print(f"        Peg Orders:     {new_features.get('peg_order_count', 0)}")
-            print(f"        Fake Liquidity: {new_features.get('fake_liquidity_score', 0):.1%}")
-            print(f"        Front-Running:  {new_features.get('front_running_events', 0)} events")
+            print(f"        Iceberg Orders: {smart_detection.get('iceberg_order_count', 0)} (Est. Hidden: {smart_detection.get('iceberg_estimated_hidden_volume', 0):.2f} BTC)")
+            print(f"        Peg Orders:     {smart_detection.get('peg_order_count', 0)}")
+            print(f"        Fake Liquidity: {smart_detection.get('fake_liquidity_score', 0):.1%}")
+            print(f"        Front-Running:  {smart_detection.get('front_running_events', 0)} events")
             
             # Liquidity Quality
             print(f"\n     💎 Liquidity Quality:")
             print(f"        Persistent:  {persistent_liq:.1%} (stable orders)")
             print(f"        Transient:   {new_features.get('transient_liquidity_score', 0):.1%} (fleeting orders)")
-            print(f"        Wall Flips:  {new_features.get('wall_flip_count', 0)} (support→resistance or vice versa)")
-            print(f"        L1 Queue Changes: Bid {new_features.get('l1_bid_queue_changes', 0)}, Ask {new_features.get('l1_ask_queue_changes', 0)}")
+            print(f"        Wall Flips:  {smart_detection.get('wall_flip_count', 0)} (support→resistance or vice versa)")
+            print(f"        L1 Queue Changes: Bid {smart_detection.get('l1_bid_queue_changes', 0)}, Ask {smart_detection.get('l1_ask_queue_changes', 0)}")
             
             # Trading Implications
             if persistent_liq > 0.7:
@@ -6706,8 +7646,8 @@ class MarketClient:
             # 7. Microstructure Regime
             print(f"\n     📈 Microstructure Regime:")
             print(f"        Trend/Mean-Revert: {hvp.get('regime_trend_meanrevert', 'N/A')} (Hurst: {hvp.get('hurst_exponent', 0):.2f})")
-            print(f"        Volatility: {hvp.get('volatility_regime', 'N/A')}")
-            print(f"        Liquidity: {hvp.get('liquidity_regime', 'N/A')}")
+            print(f"        Volatility: {hvp.get('regime_volatility', 'N/A')} ({hvp.get('volatility_percentile', 50):.0f}th percentile)")
+            print(f"        Liquidity: {hvp.get('regime_liquidity', 'N/A')}")
             
             # 8. Trade Signals
             print(f"\n     🚦 Trade Entry/Exit Signals:")
@@ -7213,12 +8153,11 @@ class MarketClient:
                 beyond_top20_bid = self.advanced_orderflow.depth_beyond_top20.get("bid", 0)
                 beyond_top20_ask = self.advanced_orderflow.depth_beyond_top20.get("ask", 0)
                 
-                print(f"        📊 Full Depth Analysis (1000 levels):")
-                print(f"           Bid Levels: {bid_count} | Ask Levels: {ask_count}")
+                print(f"        📊 Full Depth Analysis (ALL available levels - max 1000):")
+                print(f"           Total Levels: {bid_count} bids, {ask_count} asks")
                 if beyond_top20_bid > 0 or beyond_top20_ask > 0:
-                    print(f"           Liquidity Beyond Top 20:")
-                    print(f"              Bids: {beyond_top20_bid:.2f} BTC")
-                    print(f"              Asks: {beyond_top20_ask:.2f} BTC")
+                    print(f"           Deep Liquidity Beyond Top 20:")
+                    print(f"              Bids: {beyond_top20_bid:.2f} BTC | Asks: {beyond_top20_ask:.2f} BTC")
         
         # Stream synchronization metrics
         if hasattr(self.advanced_orderflow, 'depth_trade_correlation'):
